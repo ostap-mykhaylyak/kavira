@@ -1,0 +1,47 @@
+# kavira - enterprise secure mail server
+#
+# Runs as root: it binds privileged ports (25/465/587/143/993/110/995)
+# and delivers to system users' Maildirs with their own UID/GID. The
+# hardening below still confines it.
+
+[Unit]
+Description=kavira - enterprise secure mail server
+Documentation=https://github.com/ostap-mykhaylyak/kavira
+After=network-online.target
+Wants=network-online.target
+# Stop hammering if startup keeps failing (e.g. port 25 already in
+# use): after 5 failures within 60s systemd gives up and the unit
+# stays failed, so the problem is visible instead of a restart loop.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/kavira start --config /etc/kavira/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+LimitNOFILE=65536
+
+RuntimeDirectory=kavira
+RuntimeDirectoryMode=0750
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/var/log/kavira /var/lib/kavira
+# Maildir delivery to system users writes under /home.
+ProtectHome=false
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

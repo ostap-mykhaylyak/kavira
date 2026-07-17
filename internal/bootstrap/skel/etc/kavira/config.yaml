@@ -1,0 +1,75 @@
+# kavira - enterprise secure mail server
+#
+# Main configuration. Reload the running daemon with:
+#   kavira reload        (or: systemctl reload kavira)
+#
+# SECURE BY DEFAULT: kavira is never an open relay. Port 25 only
+# accepts mail for the domains configured below; relaying requires
+# authentication on 465/587 (from milestone M2).
+
+server:
+  # Public identity: SMTP banner, Received headers, default TLS
+  # certificate. Never an internal or container hostname.
+  hostname: mail.example.com
+  # Maximum concurrent protocol sessions.
+  workers: 50
+
+# Empty address disables a listener.
+listeners:
+  smtp:
+    address: ":25"
+  smtps:
+    address: ":465"
+  submission:
+    address: ":587"
+  imap:
+    address: ":143"
+  imaps:
+    address: ":993"
+  pop3:
+    address: ":110"
+  pop3s:
+    address: ":995"
+
+tls:
+  # Let's Encrypt live directory. Certificates are WILDCARDS issued
+  # on the configured domain: <cert_root>/<domain>/fullchain.pem and
+  # privkey.pem. There is never a per-subdomain directory:
+  #   mail.example.com      -> /etc/letsencrypt/live/example.com/
+  #   mail.studenti.ente.it -> /etc/letsencrypt/live/studenti.ente.it/
+  # SNI resolves the client name to the longest configured domain.
+  cert_root: /etc/letsencrypt/live
+  # TLS floor: "1.2" or "1.3". SSLv3/TLS1.0/TLS1.1 are never offered.
+  min_version: "1.2"
+  # Warn this many days before a certificate expires.
+  expiry_warn_days: 14
+
+# Hosted mail domains.
+domains:
+  - name: example.com
+    # Virtual mailboxes: defined in the users list below.
+
+  # A domain delivered to a real Linux user:
+  # - name: ostap.dev
+  #   storage:
+  #     type: system_user
+  #     user: ostap
+  #     home: /home/ostap
+  #     maildir: "{home}/mail"
+
+# Virtual mailboxes.
+users:
+  - email: admin@example.com
+    type: virtual
+    maildir: /var/mail/example.com/admin
+
+# Administrative HTTPS API. Static API keys only (no JWT):
+#   Authorization: Bearer <key>
+# Refuses to start when enabled without keys.
+api:
+  enabled: false
+  address: ":8443"
+  keys: []
+
+log:
+  dir: /var/log/kavira
