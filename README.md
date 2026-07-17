@@ -12,19 +12,24 @@ startup error, not a warning.
 
 ## Status
 
-**M0 — scaffolding** (current): lifecycle, YAML configuration with
-SIGHUP reload, JSON logging with logrotate support, TLS/SNI wildcard
-certificate store, CLI, systemd unit.
+**M1 — SMTP inbound** (current): port 25 receives mail for the hosted
+domains with structural anti open relay (a recipient is either a local
+mailbox or the transaction is refused — there is no relay code path),
+STARTTLS, Maildir delivery for system users and virtual mailboxes,
+per-IP token bucket rate limiting (connections, messages, recipients),
+VRFY/EXPN permanently disabled. On top of M0: lifecycle, YAML config
+with SIGHUP reload, JSON logging, TLS/SNI wildcard certificate store,
+CLI, systemd unit.
 
-| Milestone | Scope |
-|-----------|-------|
-| M0 | scaffolding, config, logging, TLS/SNI, CLI, systemd |
-| M1 | SMTP inbound (25), anti-relay, Maildir delivery, inbound rate limit |
-| M2 | AUTH, submission (465/587), outbound queue, retry, bounce |
-| M3 | SPF, DKIM (sign+verify), DMARC |
-| M4 | IMAP4rev1 (IDLE), POP3 |
-| M5 | antispam, reputation, warm-up, blacklist monitoring, API, metrics |
-| M6 | LXD/LXC container identity, security-check, audit |
+| Milestone | Scope | Status |
+|-----------|-------|--------|
+| M0 | scaffolding, config, logging, TLS/SNI, CLI, systemd | done |
+| M1 | SMTP inbound (25), anti-relay, Maildir delivery, inbound rate limit | done |
+| M2 | AUTH, submission (465/587), outbound queue, retry, bounce | |
+| M3 | SPF, DKIM (sign+verify), DMARC | |
+| M4 | IMAP4rev1 (IDLE), POP3 | |
+| M5 | antispam, reputation, warm-up, blacklist monitoring, API, metrics | |
+| M6 | LXD/LXC container identity, security-check, audit | |
 
 ## Build
 

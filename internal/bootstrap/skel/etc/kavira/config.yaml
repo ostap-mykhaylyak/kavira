@@ -44,6 +44,21 @@ tls:
   # Warn this many days before a certificate expires.
   expiry_warn_days: 14
 
+smtp:
+  # Maximum message size in bytes (advertised via EHLO SIZE).
+  max_size: 26214400
+  # Maximum recipients per message.
+  max_recipients: 100
+
+# Flood protection (token bucket per source IP, burst = rate).
+# Enabled by default; disable explicitly with enabled: false.
+rate_limit:
+  inbound:
+    ip:
+      connections_per_minute: 30
+      messages_per_minute: 100
+      recipients_per_minute: 500
+
 # Hosted mail domains.
 domains:
   - name: example.com

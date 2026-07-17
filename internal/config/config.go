@@ -32,6 +32,8 @@ type Config struct {
 	Server    Server    `yaml:"server"`
 	Listeners Listeners `yaml:"listeners"`
 	TLS       TLS       `yaml:"tls"`
+	SMTP      SMTP      `yaml:"smtp"`
+	RateLimit RateLimit `yaml:"rate_limit"`
 	Domains   []Domain  `yaml:"domains"`
 	Users     []User    `yaml:"users"`
 	API       API       `yaml:"api"`
@@ -77,6 +79,36 @@ type TLS struct {
 	// ExpiryWarnDays triggers expiry warnings this many days before
 	// NotAfter. 0 means default.
 	ExpiryWarnDays int `yaml:"expiry_warn_days"`
+}
+
+// SMTP holds protocol tunables for the SMTP server.
+type SMTP struct {
+	// MaxSize is the maximum message size in bytes (EHLO SIZE).
+	MaxSize int64 `yaml:"max_size"`
+	// MaxRecipients caps RCPT commands per message.
+	MaxRecipients int `yaml:"max_recipients"`
+}
+
+// RateLimit configures the flood protections.
+type RateLimit struct {
+	Inbound Inbound `yaml:"inbound"`
+}
+
+// Inbound protects against spam floods, SMTP floods, DoS and scans.
+// Enabled by default; set enabled: false to switch it off explicitly.
+type Inbound struct {
+	Enabled *bool    `yaml:"enabled"`
+	IP      IPLimits `yaml:"ip"`
+}
+
+// IsEnabled reports whether inbound rate limiting is active.
+func (i Inbound) IsEnabled() bool { return i.Enabled == nil || *i.Enabled }
+
+// IPLimits are per-source-IP token bucket rates (burst = rate).
+type IPLimits struct {
+	ConnectionsPerMinute int `yaml:"connections_per_minute"`
+	MessagesPerMinute    int `yaml:"messages_per_minute"`
+	RecipientsPerMinute  int `yaml:"recipients_per_minute"`
 }
 
 // Domain is one hosted mail domain.
@@ -140,6 +172,17 @@ func defaults() *Config {
 			CertRoot:       paths.CertRoot,
 			MinVersion:     "1.2",
 			ExpiryWarnDays: 14,
+		},
+		SMTP: SMTP{
+			MaxSize:       25 * 1024 * 1024,
+			MaxRecipients: 100,
+		},
+		RateLimit: RateLimit{
+			Inbound: Inbound{IP: IPLimits{
+				ConnectionsPerMinute: 30,
+				MessagesPerMinute:    100,
+				RecipientsPerMinute:  500,
+			}},
 		},
 		API: API{Address: ":8443"},
 		Log: Log{Dir: paths.LogDir},
@@ -240,6 +283,24 @@ func (c *Config) validate() error {
 	}
 	if c.TLS.CertRoot == "" {
 		c.TLS.CertRoot = paths.CertRoot
+	}
+
+	// --- smtp ---
+	if c.SMTP.MaxSize <= 0 {
+		return fmt.Errorf("smtp.max_size: must be positive")
+	}
+	if c.SMTP.MaxRecipients <= 0 {
+		return fmt.Errorf("smtp.max_recipients: must be positive")
+	}
+
+	// --- rate_limit ---
+	if c.RateLimit.Inbound.IsEnabled() {
+		ip := c.RateLimit.Inbound.IP
+		if ip.ConnectionsPerMinute <= 0 || ip.MessagesPerMinute <= 0 || ip.RecipientsPerMinute <= 0 {
+			return fmt.Errorf("rate_limit.inbound.ip: all limits must be positive (or set enabled: false)")
+		}
+	} else {
+		c.warnf("inbound rate limiting is disabled: no flood protection")
 	}
 
 	// --- domains ---

@@ -18,6 +18,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,8 +27,12 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
 	"github.com/ostap-mykhaylyak/kavira/internal/logging"
+	"github.com/ostap-mykhaylyak/kavira/internal/maildir"
 	"github.com/ostap-mykhaylyak/kavira/internal/paths"
 	"github.com/ostap-mykhaylyak/kavira/internal/proc"
+	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
+	"github.com/ostap-mykhaylyak/kavira/internal/smtp"
+	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 	ktls "github.com/ostap-mykhaylyak/kavira/internal/tls"
 )
 
@@ -175,8 +180,37 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	logs.Service.Info("tls certificates loaded",
 		"domains", store.Loaded(), "min_version", cfg.TLS.MinVersion)
 
-	// From M1 on the protocol listeners start here, consuming
-	// store.Config() and mgr.Get() per session.
+	// --- SMTP inbound (port 25) ---
+	var smtpSrv *smtp.Server
+	if addr := cfg.Listeners.SMTP.Address; addr != "" {
+		backend := smtp.Backend{
+			IsLocalDomain: func(d string) bool { return mgr.Get().HasDomain(d) },
+			Lookup: func(email string) (storage.Mailbox, bool) {
+				return storage.Resolve(mgr.Get(), email)
+			},
+			Deliver: func(mb storage.Mailbox, msg []byte) error {
+				_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
+				return err
+			},
+			Postmaster: func() string {
+				if doms := mgr.Get().Domains; len(doms) > 0 {
+					return "postmaster@" + doms[0].Name
+				}
+				return ""
+			},
+		}
+		smtpSrv = smtp.New(smtpSettings(cfg, store), backend, cfg.Server.Workers, logs.Service)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("smtp listener %s: %w", addr, err)
+		}
+		go func() {
+			if err := smtpSrv.Serve(ln); err != nil {
+				logs.Service.Error("smtp server failed", "error", err.Error())
+			}
+		}()
+		logs.Service.Info("smtp listening", "protocol", "smtp", "address", addr)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGTERM, os.Interrupt)
@@ -189,6 +223,11 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		case <-refresh.C:
 			for _, w := range store.Reload(tlsParams(mgr.Get())) {
 				logs.Service.Warn("tls warning", "warning", w)
+			}
+			// A certificate may have appeared on a fresh install:
+			// re-evaluate the STARTTLS offer.
+			if smtpSrv != nil {
+				smtpSrv.Update(smtpSettings(mgr.Get(), store))
 			}
 
 		case s := <-sigs:
@@ -209,17 +248,40 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 				for _, w := range store.Reload(tlsParams(cfg)) {
 					logs.Service.Warn("tls warning", "warning", w)
 				}
+				if smtpSrv != nil {
+					smtpSrv.Update(smtpSettings(cfg, store))
+				}
 				logs.Service.Info("reload complete",
 					"domains", len(cfg.Domains), "tls_loaded", store.Loaded())
 
 			default: // SIGTERM, Interrupt
 				logs.Service.Info("shutdown requested", "signal", s.String())
-				// Graceful drain of protocol sessions lands with M1.
+				if smtpSrv != nil {
+					smtpSrv.Shutdown(30 * time.Second)
+				}
 				logs.Service.Info("stopped")
 				return nil
 			}
 		}
 	}
+}
+
+// smtpSettings maps the current config onto the SMTP server. STARTTLS
+// is offered only when at least one certificate actually loaded.
+func smtpSettings(cfg *config.Config, store *ktls.Store) smtp.Settings {
+	set := smtp.Settings{
+		Hostname:      cfg.Server.Hostname,
+		MaxSize:       cfg.SMTP.MaxSize,
+		MaxRecipients: cfg.SMTP.MaxRecipients,
+	}
+	if len(store.Loaded()) > 0 {
+		set.TLS = store.Config()
+	}
+	if in := cfg.RateLimit.Inbound; in.IsEnabled() {
+		set.Limits = ratelimit.NewInbound(
+			in.IP.ConnectionsPerMinute, in.IP.MessagesPerMinute, in.IP.RecipientsPerMinute)
+	}
+	return set
 }
 
 func tlsParams(cfg *config.Config) ktls.Params {
