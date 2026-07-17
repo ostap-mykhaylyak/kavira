@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	stdtls "crypto/tls"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ostap-mykhaylyak/kavira/internal/auth"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 )
 
@@ -33,14 +36,16 @@ type session struct {
 
 	helo    string
 	tls     bool
+	authed  string // authenticated user address, "" = none
 	from    string
 	fromSet bool
 	rcpts   []rcpt
 }
 
 type rcpt struct {
-	addr string
-	mb   storage.Mailbox
+	addr   string
+	remote bool // submission relay: enqueue instead of deliver
+	mb     storage.Mailbox
 }
 
 func newSession(srv *Server, conn net.Conn, ip string) *session {
@@ -50,6 +55,7 @@ func newSession(srv *Server, conn net.Conn, ip string) *session {
 		r:    bufio.NewReaderSize(conn, 4096),
 		w:    bufio.NewWriterSize(conn, 4096),
 		ip:   ip,
+		tls:  srv.set.Load().ImplicitTLS,
 	}
 }
 
@@ -122,9 +128,7 @@ func (s *session) run() {
 			// Permanently disabled: user enumeration.
 			s.reply("502 5.5.1 command disabled")
 		case "AUTH":
-			// Inbound port 25 never authenticates; submission (M2)
-			// has its own listeners.
-			s.reply("503 5.5.1 authentication not available on this port")
+			s.cmdAuth(arg)
 		case "HELP":
 			s.reply("214 2.0.0 see RFC 5321")
 		default:
@@ -164,6 +168,11 @@ func (s *session) cmdHelo(arg string, extended bool) (quit bool) {
 	if set.TLS != nil && !s.tls {
 		caps = append(caps, "250-STARTTLS")
 	}
+	// AUTH is offered only on submission and only over TLS: PLAIN and
+	// LOGIN carry the password, they never travel in clear.
+	if set.Mode == ModeSubmission && s.tls && s.srv.backend.Authenticate != nil {
+		caps = append(caps, "250-AUTH PLAIN LOGIN")
+	}
 	caps[len(caps)-1] = "250 " + caps[len(caps)-1][4:]
 	for _, c := range caps[:len(caps)-1] {
 		s.w.WriteString(c + "\r\n")
@@ -202,6 +211,109 @@ func (s *session) cmdStartTLS() (quit bool) {
 	return false
 }
 
+// cmdAuth implements AUTH PLAIN and AUTH LOGIN, submission-only and
+// TLS-only.
+func (s *session) cmdAuth(arg string) {
+	set := s.set()
+	if set.Mode != ModeSubmission || s.srv.backend.Authenticate == nil {
+		s.reply("503 5.5.1 authentication not available on this port")
+		return
+	}
+	if !s.tls {
+		s.reply("530 5.7.0 must issue STARTTLS first")
+		return
+	}
+	if s.authed != "" {
+		s.reply("503 5.5.1 already authenticated")
+		return
+	}
+
+	mech, rest, _ := strings.Cut(arg, " ")
+	var user, pass string
+	var ok bool
+	switch strings.ToUpper(mech) {
+	case "PLAIN":
+		user, pass, ok = s.authPlain(rest)
+	case "LOGIN":
+		user, pass, ok = s.authLogin()
+	default:
+		s.reply("504 5.5.4 mechanism not supported")
+		return
+	}
+	if !ok {
+		return // reply already sent
+	}
+
+	switch err := s.srv.backend.Authenticate(user, pass, s.ip); {
+	case err == nil:
+		s.authed = strings.ToLower(user)
+		s.srv.log.Info("authentication succeeded",
+			"event", "auth_ok", "protocol", "smtp", "ip", s.ip, "user", s.authed)
+		s.reply("235 2.7.0 authentication successful")
+	case errors.Is(err, auth.ErrLocked):
+		s.srv.log.Warn("authentication locked out",
+			"event", "auth_locked", "protocol", "smtp", "ip", s.ip, "user", user, "action", "reject")
+		s.reply("454 4.7.0 too many failed attempts, try again later")
+	default:
+		s.srv.log.Warn("authentication failed",
+			"event", "auth_failed", "protocol", "smtp", "ip", s.ip, "user", user, "action", "reject")
+		s.reply("535 5.7.8 authentication credentials invalid")
+	}
+}
+
+// authPlain handles AUTH PLAIN with or without an initial response.
+func (s *session) authPlain(initial string) (user, pass string, ok bool) {
+	resp := initial
+	if resp == "" {
+		if err := s.reply("334 "); err != nil {
+			return "", "", false
+		}
+		line, err := s.readLine()
+		if err != nil || line == "*" {
+			s.reply("501 5.7.0 authentication cancelled")
+			return "", "", false
+		}
+		resp = line
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp)
+	if err != nil {
+		s.reply("501 5.5.2 invalid base64")
+		return "", "", false
+	}
+	// authzid \0 authcid \0 password
+	parts := strings.Split(string(raw), "\x00")
+	if len(parts) != 3 || parts[1] == "" {
+		s.reply("501 5.5.2 invalid PLAIN response")
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+// authLogin handles the two-step AUTH LOGIN dialogue.
+func (s *session) authLogin() (user, pass string, ok bool) {
+	for i, prompt := range []string{"334 VXNlcm5hbWU6", "334 UGFzc3dvcmQ6"} {
+		if err := s.reply(prompt); err != nil {
+			return "", "", false
+		}
+		line, err := s.readLine()
+		if err != nil || line == "*" {
+			s.reply("501 5.7.0 authentication cancelled")
+			return "", "", false
+		}
+		raw, derr := base64.StdEncoding.DecodeString(line)
+		if derr != nil {
+			s.reply("501 5.5.2 invalid base64")
+			return "", "", false
+		}
+		if i == 0 {
+			user = string(raw)
+		} else {
+			pass = string(raw)
+		}
+	}
+	return user, pass, true
+}
+
 func (s *session) cmdMail(arg string) {
 	if s.helo == "" {
 		s.reply("503 5.5.1 send HELO/EHLO first")
@@ -209,6 +321,11 @@ func (s *session) cmdMail(arg string) {
 	}
 	if s.fromSet {
 		s.reply("503 5.5.1 nested MAIL command")
+		return
+	}
+	set := s.set()
+	if set.Mode == ModeSubmission && s.authed == "" {
+		s.reply("530 5.7.0 authentication required")
 		return
 	}
 	addr, params, err := parsePath(arg, "FROM:")
@@ -221,13 +338,23 @@ func (s *session) cmdMail(arg string) {
 		s.reply("501 5.5.4 invalid SIZE parameter")
 		return
 	}
-	set := s.set()
 	if size > set.MaxSize {
 		s.reply(fmt.Sprintf("552 5.3.4 message exceeds maximum size %d", set.MaxSize))
 		return
 	}
-	// addr may be empty: the null reverse-path of bounces.
-	s.from = strings.ToLower(addr)
+	addr = strings.ToLower(addr)
+	// Submission: the sender identity is the authenticated user, not
+	// whatever the client claims. Spoofed From at the envelope level
+	// is refused and logged.
+	if set.Mode == ModeSubmission && addr != s.authed {
+		s.srv.log.Warn("sender spoof rejected",
+			"event", "sender_mismatch", "protocol", "smtp", "ip", s.ip,
+			"user", s.authed, "claimed", addr, "action", "reject")
+		s.reply("553 5.7.1 sender address must be the authenticated user")
+		return
+	}
+	// addr may be empty on port 25: the null reverse-path of bounces.
+	s.from = addr
 	s.fromSet = true
 	s.reply("250 2.1.0 OK")
 }
@@ -260,19 +387,40 @@ func (s *session) cmdRcpt(arg string) {
 		return
 	}
 
-	// ANTI OPEN RELAY: this listener only ever accepts mail FOR the
-	// hosted domains. Everything else is refused, unconditionally.
-	if !s.srv.backend.IsLocalDomain(domain) {
-		s.srv.log.Warn("relay denied",
-			"event", "relay_denied", "protocol", "smtp", "ip", s.ip,
-			"from", s.from, "rcpt", addr, "action", "reject")
-		s.reply("554 5.7.1 relay access denied")
-		return
+	local := s.srv.backend.IsLocalDomain(domain)
+	if set.Mode == ModeInbound {
+		// ANTI OPEN RELAY: port 25 only ever accepts mail FOR the
+		// hosted domains. Everything else is refused,
+		// unconditionally.
+		if !local {
+			s.srv.log.Warn("relay denied",
+				"event", "relay_denied", "protocol", "smtp", "ip", s.ip,
+				"from", s.from, "rcpt", addr, "action", "reject")
+			s.reply("554 5.7.1 relay access denied")
+			return
+		}
+		if !set.Limits.RcptAllowed(s.ip) {
+			s.srv.log.Warn("recipient rate limited",
+				"event", "ratelimit", "protocol", "smtp", "ip", s.ip, "action", "reject_rcpt")
+			s.reply("452 4.4.5 too many recipients, slow down")
+			return
+		}
+	} else {
+		// Submission: per-user outbound protection (compromised
+		// account containment).
+		if !set.OutLimits.RcptAllowed(s.authed) {
+			s.srv.log.Warn("outbound recipient limit exceeded",
+				"event", "ratelimit_out", "protocol", "smtp", "ip", s.ip,
+				"user", s.authed, "action", "reject_rcpt")
+			s.reply("452 4.4.5 recipient quota exceeded, try again later")
+			return
+		}
 	}
-	if !set.Limits.RcptAllowed(s.ip) {
-		s.srv.log.Warn("recipient rate limited",
-			"event", "ratelimit", "protocol", "smtp", "ip", s.ip, "action", "reject_rcpt")
-		s.reply("452 4.4.5 too many recipients, slow down")
+
+	if !local {
+		// Remote recipient on submission: relay via the queue.
+		s.rcpts = append(s.rcpts, rcpt{addr: addr, remote: true})
+		s.reply("250 2.1.5 OK")
 		return
 	}
 	mb, ok := s.srv.backend.Lookup(addr)
@@ -290,11 +438,19 @@ func (s *session) cmdData() (quit bool) {
 		return false
 	}
 	set := s.set()
-	if !set.Limits.MsgAllowed(s.ip) {
-		s.srv.log.Warn("message rate limited",
-			"event", "ratelimit", "protocol", "smtp", "ip", s.ip, "action", "reject_message")
-		s.reply("421 4.7.0 too many messages, closing connection")
-		return true
+	if set.Mode == ModeInbound {
+		if !set.Limits.MsgAllowed(s.ip) {
+			s.srv.log.Warn("message rate limited",
+				"event", "ratelimit", "protocol", "smtp", "ip", s.ip, "action", "reject_message")
+			s.reply("421 4.7.0 too many messages, closing connection")
+			return true
+		}
+	} else if !set.OutLimits.MsgAllowed(s.authed) {
+		s.srv.log.Warn("outbound message limit exceeded",
+			"event", "ratelimit_out", "protocol", "smtp", "ip", s.ip,
+			"user", s.authed, "action", "suspend_sending")
+		s.reply("452 4.2.1 sending quota exceeded, try again later")
+		return false
 	}
 	if err := s.reply("354 end data with <CRLF>.<CRLF>"); err != nil {
 		return true
@@ -318,23 +474,33 @@ func (s *session) cmdData() (quit bool) {
 	}
 
 	msg := s.assemble(buf.Bytes())
-	delivered := 0
+	accepted := 0
 	for _, r := range s.rcpts {
-		if err := s.srv.backend.Deliver(r.mb, msg); err != nil {
+		var err error
+		if r.remote {
+			err = s.srv.backend.Enqueue(s.from, r.addr, msg)
+		} else {
+			err = s.srv.backend.Deliver(r.mb, msg)
+		}
+		if err != nil {
 			s.srv.log.Error("delivery failed",
 				"event", "delivery_error", "protocol", "smtp", "ip", s.ip,
 				"rcpt", r.addr, "error", err.Error())
 			continue
 		}
-		delivered++
+		accepted++
 	}
-	if delivered == 0 {
+	if accepted == 0 {
 		s.resetTransaction()
-		s.reply("451 4.3.0 local delivery failed, try again later")
+		s.reply("451 4.3.0 delivery failed, try again later")
 		return false
 	}
-	s.srv.log.Info("message received",
-		"event", "message_in", "protocol", "smtp", "ip", s.ip,
+	event := "message_in"
+	if set.Mode == ModeSubmission {
+		event = "message_submitted"
+	}
+	s.srv.log.Info("message accepted",
+		"event", event, "protocol", "smtp", "ip", s.ip, "user", s.authed,
 		"from", s.from, "rcpts", len(s.rcpts), "size", n, "tls", s.tls)
 	s.resetTransaction()
 	s.reply("250 2.0.0 OK message accepted for delivery")
@@ -349,12 +515,18 @@ func (s *session) assemble(body []byte) []byte {
 	if s.tls {
 		with = "ESMTPS"
 	}
+	if s.authed != "" {
+		with = "ESMTPSA"
+	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "Return-Path: <%s>\r\n", s.from)
-	fmt.Fprintf(&b, "Received: from %s (%s)\r\n\tby %s (Kavira) with %s\r\n",
+	fmt.Fprintf(&b, "Received: from %s (%s)\r\n\tby %s (Kavira) with %s",
 		s.helo, s.ip, set.Hostname, with)
+	// The for clause names the recipient only when there is exactly
+	// one: with several, disclosing the full list to each of them
+	// would leak the envelope.
 	if len(s.rcpts) == 1 {
-		fmt.Fprintf(&b, "\tfor <%s>", s.rcpts[0].addr)
+		fmt.Fprintf(&b, "\r\n\tfor <%s>", s.rcpts[0].addr)
 	}
 	fmt.Fprintf(&b, ";\r\n\t%s\r\n", time.Now().Format(time.RFC1123Z))
 	b.Write(body)

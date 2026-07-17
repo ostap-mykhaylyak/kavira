@@ -33,6 +33,8 @@ type Config struct {
 	Listeners Listeners `yaml:"listeners"`
 	TLS       TLS       `yaml:"tls"`
 	SMTP      SMTP      `yaml:"smtp"`
+	Auth      Auth      `yaml:"auth"`
+	Queue     Queue     `yaml:"queue"`
 	RateLimit RateLimit `yaml:"rate_limit"`
 	Domains   []Domain  `yaml:"domains"`
 	Users     []User    `yaml:"users"`
@@ -89,9 +91,42 @@ type SMTP struct {
 	MaxRecipients int `yaml:"max_recipients"`
 }
 
+// Auth configures the brute force protections.
+type Auth struct {
+	// MaxFailures locks a user/IP after this many failed attempts.
+	MaxFailures int `yaml:"max_failures"`
+	// LockoutMinutes is how long the lockout lasts.
+	LockoutMinutes int `yaml:"lockout_minutes"`
+}
+
+// Queue configures the outbound queue.
+type Queue struct {
+	// Dir is the on-disk queue directory.
+	Dir string `yaml:"dir"`
+	// MaxAttempts caps transient retries before bouncing.
+	MaxAttempts int `yaml:"max_attempts"`
+}
+
 // RateLimit configures the flood protections.
 type RateLimit struct {
-	Inbound Inbound `yaml:"inbound"`
+	Inbound  Inbound  `yaml:"inbound"`
+	Outbound Outbound `yaml:"outbound"`
+}
+
+// Outbound protects against compromised accounts: per-user sending
+// caps. Enabled by default.
+type Outbound struct {
+	Enabled *bool      `yaml:"enabled"`
+	User    UserLimits `yaml:"user"`
+}
+
+// IsEnabled reports whether outbound rate limiting is active.
+func (o Outbound) IsEnabled() bool { return o.Enabled == nil || *o.Enabled }
+
+// UserLimits are per-authenticated-user token bucket rates per hour.
+type UserLimits struct {
+	MessagesPerHour   int `yaml:"messages_per_hour"`
+	RecipientsPerHour int `yaml:"recipients_per_hour"`
 }
 
 // Inbound protects against spam floods, SMTP floods, DoS and scans.
@@ -128,6 +163,9 @@ type Storage struct {
 	Home string `yaml:"home"`
 	// Maildir is the mailbox path; "{home}" expands to Home.
 	Maildir string `yaml:"maildir"`
+	// PasswordHash authenticates the bound account for submission
+	// (argon2id or bcrypt). Empty means the account cannot submit.
+	PasswordHash string `yaml:"password_hash"`
 }
 
 // MaildirPath returns the Maildir with "{home}" expanded.
@@ -140,6 +178,26 @@ type User struct {
 	Email   string `yaml:"email"`
 	Type    string `yaml:"type"`
 	Maildir string `yaml:"maildir"`
+	// PasswordHash authenticates the user for submission (argon2id
+	// or bcrypt, never cleartext). Empty means no submission.
+	PasswordHash string `yaml:"password_hash"`
+}
+
+// PasswordHashFor returns the stored hash for an address, across
+// virtual users and system_user domains.
+func (c *Config) PasswordHashFor(email string) (string, bool) {
+	for _, u := range c.Users {
+		if u.Email == email && u.PasswordHash != "" {
+			return u.PasswordHash, true
+		}
+	}
+	for _, d := range c.Domains {
+		if d.Storage.Type == StorageSystemUser && d.Storage.PasswordHash != "" &&
+			email == d.Storage.User+"@"+d.Name {
+			return d.Storage.PasswordHash, true
+		}
+	}
+	return "", false
 }
 
 // API configures the administrative HTTPS API. Authentication is
@@ -177,11 +235,23 @@ func defaults() *Config {
 			MaxSize:       25 * 1024 * 1024,
 			MaxRecipients: 100,
 		},
+		Auth: Auth{
+			MaxFailures:    10,
+			LockoutMinutes: 15,
+		},
+		Queue: Queue{
+			Dir:         paths.QueueDir,
+			MaxAttempts: 10,
+		},
 		RateLimit: RateLimit{
 			Inbound: Inbound{IP: IPLimits{
 				ConnectionsPerMinute: 30,
 				MessagesPerMinute:    100,
 				RecipientsPerMinute:  500,
+			}},
+			Outbound: Outbound{User: UserLimits{
+				MessagesPerHour:   500,
+				RecipientsPerHour: 1000,
 			}},
 		},
 		API: API{Address: ":8443"},
@@ -293,6 +363,22 @@ func (c *Config) validate() error {
 		return fmt.Errorf("smtp.max_recipients: must be positive")
 	}
 
+	// --- auth ---
+	if c.Auth.MaxFailures <= 0 {
+		return fmt.Errorf("auth.max_failures: must be positive")
+	}
+	if c.Auth.LockoutMinutes <= 0 {
+		return fmt.Errorf("auth.lockout_minutes: must be positive")
+	}
+
+	// --- queue ---
+	if c.Queue.Dir == "" {
+		c.Queue.Dir = paths.QueueDir
+	}
+	if c.Queue.MaxAttempts <= 0 {
+		return fmt.Errorf("queue.max_attempts: must be positive")
+	}
+
 	// --- rate_limit ---
 	if c.RateLimit.Inbound.IsEnabled() {
 		ip := c.RateLimit.Inbound.IP
@@ -301,6 +387,14 @@ func (c *Config) validate() error {
 		}
 	} else {
 		c.warnf("inbound rate limiting is disabled: no flood protection")
+	}
+	if c.RateLimit.Outbound.IsEnabled() {
+		u := c.RateLimit.Outbound.User
+		if u.MessagesPerHour <= 0 || u.RecipientsPerHour <= 0 {
+			return fmt.Errorf("rate_limit.outbound.user: all limits must be positive (or set enabled: false)")
+		}
+	} else {
+		c.warnf("outbound rate limiting is disabled: no compromised-account protection")
 	}
 
 	// --- domains ---
@@ -333,6 +427,9 @@ func (c *Config) validate() error {
 			if st.Maildir == "" {
 				st.Maildir = "{home}/mail"
 			}
+			if st.PasswordHash != "" && !knownHash(st.PasswordHash) {
+				return fmt.Errorf("domain %s: storage.password_hash: unknown format (argon2id or bcrypt required, never cleartext)", d.Name)
+			}
 		default:
 			return fmt.Errorf("domain %s: storage.type %q: must be %q or %q",
 				d.Name, st.Type, StorageSystemUser, StorageVirtual)
@@ -362,6 +459,9 @@ func (c *Config) validate() error {
 		if dom := u.Email[at+1:]; !c.HasDomain(dom) {
 			c.warnf("user %s: domain %s is not configured", u.Email, dom)
 		}
+		if u.PasswordHash != "" && !knownHash(u.PasswordHash) {
+			return fmt.Errorf("user %s: password_hash: unknown format (argon2id or bcrypt required, never cleartext)", u.Email)
+		}
 	}
 
 	// --- api ---
@@ -390,6 +490,12 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// knownHash reports whether a password hash uses a supported format.
+func knownHash(h string) bool {
+	return strings.HasPrefix(h, "$argon2id$") ||
+		strings.HasPrefix(h, "$2a$") || strings.HasPrefix(h, "$2b$") || strings.HasPrefix(h, "$2y$")
 }
 
 // normalizeHost lowercases and strips whitespace and a trailing dot.

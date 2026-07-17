@@ -28,15 +28,36 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 )
 
+// Mode selects the personality of a listener.
+type Mode int
+
+const (
+	// ModeInbound is port 25: unauthenticated MX reception for local
+	// domains only. AUTH is refused, relay is structurally impossible.
+	ModeInbound Mode = iota
+	// ModeSubmission is 587/465: message submission by authenticated
+	// users (RFC 6409). Relay to any domain, but only after AUTH over
+	// TLS, and only with the sender identity of the authenticated
+	// user.
+	ModeSubmission
+)
+
 // Settings are the per-reload tunables of the server.
 type Settings struct {
 	Hostname      string
 	MaxSize       int64
 	MaxRecipients int
+	Mode          Mode
+	// ImplicitTLS marks sessions as TLS from byte one (port 465; the
+	// listener itself is wrapped by the caller).
+	ImplicitTLS bool
 	// TLS enables STARTTLS when non-nil.
 	TLS *stdtls.Config
-	// Limits is the inbound rate limiter set; nil disables limiting.
+	// Limits is the per-IP inbound rate limiter set; nil disables it.
 	Limits *ratelimit.Inbound
+	// OutLimits is the per-user outbound limiter set (submission);
+	// nil disables it.
+	OutLimits *ratelimit.Outbound
 }
 
 // Backend answers the questions the protocol cannot: what is local
@@ -53,6 +74,13 @@ type Backend struct {
 	// Postmaster returns the address behind a bare RCPT
 	// TO:<postmaster>, or "" when none is configured.
 	Postmaster func() string
+	// Authenticate verifies credentials (submission). A nil error
+	// authenticates; auth.ErrLocked and auth.ErrInvalid map to reply
+	// codes. Nil Authenticate disables AUTH entirely.
+	Authenticate func(email, password, ip string) error
+	// Enqueue stores an outbound message for a remote recipient
+	// (submission relay path).
+	Enqueue func(from, rcpt string, data []byte) error
 }
 
 // Server accepts inbound SMTP connections.

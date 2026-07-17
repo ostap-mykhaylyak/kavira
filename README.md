@@ -12,20 +12,28 @@ startup error, not a warning.
 
 ## Status
 
-**M1 — SMTP inbound** (current): port 25 receives mail for the hosted
-domains with structural anti open relay (a recipient is either a local
-mailbox or the transaction is refused — there is no relay code path),
+**M2 — submission and outbound** (current): authenticated submission
+on 587 (STARTTLS) and 465 (implicit TLS) with AUTH PLAIN/LOGIN over
+TLS only, Argon2id/bcrypt password hashes (never cleartext), brute
+force protection (progressive delays + user/IP lockout), envelope
+sender enforced to the authenticated user, per-user outbound quotas
+(messages/recipients per hour). Disk-backed outbound queue with MX
+lookup, opportunistic STARTTLS, exponential retry on 4xx and RFC 3464
+bounces on 5xx or exhausted retries.
+
+Already in place — M1: port 25 receives mail for the hosted domains
+with structural anti open relay (a recipient is either a local mailbox
+or the transaction is refused — there is no relay code path on 25),
 STARTTLS, Maildir delivery for system users and virtual mailboxes,
-per-IP token bucket rate limiting (connections, messages, recipients),
-VRFY/EXPN permanently disabled. On top of M0: lifecycle, YAML config
-with SIGHUP reload, JSON logging, TLS/SNI wildcard certificate store,
-CLI, systemd unit.
+per-IP token bucket rate limiting, VRFY/EXPN permanently disabled.
+M0: lifecycle, YAML config with SIGHUP reload, JSON logging, TLS/SNI
+wildcard certificate store, CLI, systemd unit.
 
 | Milestone | Scope | Status |
 |-----------|-------|--------|
 | M0 | scaffolding, config, logging, TLS/SNI, CLI, systemd | done |
 | M1 | SMTP inbound (25), anti-relay, Maildir delivery, inbound rate limit | done |
-| M2 | AUTH, submission (465/587), outbound queue, retry, bounce | |
+| M2 | AUTH, submission (465/587), outbound queue, retry, bounce | done |
 | M3 | SPF, DKIM (sign+verify), DMARC | |
 | M4 | IMAP4rev1 (IDLE), POP3 | |
 | M5 | antispam, reputation, warm-up, blacklist monitoring, API, metrics | |
@@ -61,6 +69,7 @@ kavira start           run the daemon in the foreground (systemd)
 kavira stop            signal the running daemon to shut down
 kavira reload          reload config, certificates and log files
 kavira check-config    validate the configuration and exit
+kavira hash-password   read a password from stdin, print argon2id hash
 kavira version         print version and exit
 ```
 

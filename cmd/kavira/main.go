@@ -16,20 +16,25 @@
 package main
 
 import (
+	"bufio"
+	stdtls "crypto/tls"
 	"flag"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/ostap-mykhaylyak/kavira/internal/auth"
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
 	"github.com/ostap-mykhaylyak/kavira/internal/logging"
 	"github.com/ostap-mykhaylyak/kavira/internal/maildir"
 	"github.com/ostap-mykhaylyak/kavira/internal/paths"
 	"github.com/ostap-mykhaylyak/kavira/internal/proc"
+	"github.com/ostap-mykhaylyak/kavira/internal/queue"
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
 	"github.com/ostap-mykhaylyak/kavira/internal/smtp"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
@@ -89,6 +94,22 @@ func main() {
 	case "version":
 		fmt.Println("kavira", version)
 
+	case "hash-password":
+		// Read from stdin (not argv: passwords must not land in the
+		// shell history or the process list).
+		fmt.Fprint(os.Stderr, "password: ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			fatalIf(err)
+		}
+		pw := strings.TrimRight(line, "\r\n")
+		if pw == "" {
+			fatalIf(fmt.Errorf("empty password"))
+		}
+		h, err := auth.HashArgon2id(pw)
+		fatalIf(err)
+		fmt.Println(h)
+
 	case "generate-dkim":
 		notYet(cmd, "M3")
 	case "security-check", "audit", "container-check":
@@ -109,6 +130,7 @@ Commands:
   stop           signal the running daemon to shut down
   reload         signal the running daemon to reload config and certs
   check-config   validate the configuration and exit
+  hash-password  read a password from stdin, print its argon2id hash
   version        print version and exit
 
 Planned:
@@ -180,36 +202,107 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	logs.Service.Info("tls certificates loaded",
 		"domains", store.Loaded(), "min_version", cfg.TLS.MinVersion)
 
-	// --- SMTP inbound (port 25) ---
-	var smtpSrv *smtp.Server
-	if addr := cfg.Listeners.SMTP.Address; addr != "" {
-		backend := smtp.Backend{
-			IsLocalDomain: func(d string) bool { return mgr.Get().HasDomain(d) },
-			Lookup: func(email string) (storage.Mailbox, bool) {
-				return storage.Resolve(mgr.Get(), email)
-			},
-			Deliver: func(mb storage.Mailbox, msg []byte) error {
-				_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
-				return err
-			},
-			Postmaster: func() string {
-				if doms := mgr.Get().Domains; len(doms) > 0 {
-					return "postmaster@" + doms[0].Name
-				}
-				return ""
-			},
+	// --- outbound queue + scheduler ---
+	q, err := queue.Open(cfg.Queue.Dir)
+	if err != nil {
+		return err
+	}
+	transport := &queue.SMTPTransport{Hostname: cfg.Server.Hostname}
+	bounceFn := func(e *queue.Envelope, reason string) {
+		data := queue.BuildBounce(mgr.Get().Server.Hostname, e, reason)
+		if data == nil {
+			return // null reverse-path: never bounce a bounce
 		}
-		smtpSrv = smtp.New(smtpSettings(cfg, store), backend, cfg.Server.Workers, logs.Service)
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("smtp listener %s: %w", addr, err)
+		mb, ok := storage.Resolve(mgr.Get(), e.From)
+		if !ok {
+			logs.Service.Warn("bounce dropped: sender not local",
+				"event", "bounce_dropped", "queue_id", e.ID, "from", e.From)
+			return
 		}
-		go func() {
-			if err := smtpSrv.Serve(ln); err != nil {
-				logs.Service.Error("smtp server failed", "error", err.Error())
+		full := append([]byte("Return-Path: <>\r\n"), data...)
+		if _, err := maildir.Deliver(mb.Dir, full, mb.UID, mb.GID); err != nil {
+			logs.Service.Error("bounce delivery failed",
+				"queue_id", e.ID, "from", e.From, "error", err.Error())
+		}
+	}
+	sched := queue.NewScheduler(q, transport, bounceFn, cfg.Queue.MaxAttempts, logs.Service)
+	schedStop := make(chan struct{})
+	go sched.Run(schedStop)
+	logs.Service.Info("outbound queue open", "dir", cfg.Queue.Dir, "pending", q.Size())
+
+	// --- authentication (survives reloads: lookup reads mgr.Get()) ---
+	authr := auth.New(
+		func(email string) (string, bool) { return mgr.Get().PasswordHashFor(email) },
+		cfg.Auth.MaxFailures, time.Duration(cfg.Auth.LockoutMinutes)*time.Minute)
+
+	backend := smtp.Backend{
+		IsLocalDomain: func(d string) bool { return mgr.Get().HasDomain(d) },
+		Lookup: func(email string) (storage.Mailbox, bool) {
+			return storage.Resolve(mgr.Get(), email)
+		},
+		Deliver: func(mb storage.Mailbox, msg []byte) error {
+			_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
+			return err
+		},
+		Postmaster: func() string {
+			if doms := mgr.Get().Domains; len(doms) > 0 {
+				return "postmaster@" + doms[0].Name
 			}
-		}()
-		logs.Service.Info("smtp listening", "protocol", "smtp", "address", addr)
+			return ""
+		},
+		Authenticate: authr.Verify,
+		Enqueue:      q.Enqueue,
+	}
+
+	// --- listeners: 25 inbound, 587 submission, 465 submission TLS ---
+	limits := newLimits(cfg)
+	specs := []struct {
+		name     string
+		addr     string
+		mode     smtp.Mode
+		implicit bool
+	}{
+		{"smtp", cfg.Listeners.SMTP.Address, smtp.ModeInbound, false},
+		{"submission", cfg.Listeners.Submission.Address, smtp.ModeSubmission, false},
+		{"smtps", cfg.Listeners.SMTPS.Address, smtp.ModeSubmission, true},
+	}
+	type running struct {
+		srv      *smtp.Server
+		mode     smtp.Mode
+		implicit bool
+	}
+	var servers []running
+	for _, sp := range specs {
+		if sp.addr == "" {
+			continue
+		}
+		if sp.mode == smtp.ModeSubmission && len(store.Loaded()) == 0 {
+			// Secure by default: submission without TLS would expose
+			// credentials, better no listener than a plaintext one.
+			logs.Service.Warn("submission listener disabled: no TLS certificate loaded",
+				"protocol", sp.name, "address", sp.addr)
+			continue
+		}
+		ln, err := net.Listen("tcp", sp.addr)
+		if err != nil {
+			return fmt.Errorf("%s listener %s: %w", sp.name, sp.addr, err)
+		}
+		if sp.implicit {
+			ln = stdtls.NewListener(ln, store.Config())
+		}
+		srv := smtp.New(smtpSettings(cfg, store, sp.mode, sp.implicit, limits), backend, cfg.Server.Workers, logs.Service)
+		go func(name string) {
+			if err := srv.Serve(ln); err != nil {
+				logs.Service.Error("smtp server failed", "protocol", name, "error", err.Error())
+			}
+		}(sp.name)
+		servers = append(servers, running{srv, sp.mode, sp.implicit})
+		logs.Service.Info("listening", "protocol", sp.name, "address", sp.addr, "mode", int(sp.mode))
+	}
+	updateAll := func(cfg *config.Config, lim limitSet) {
+		for _, r := range servers {
+			r.srv.Update(smtpSettings(cfg, store, r.mode, r.implicit, lim))
+		}
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -225,10 +318,9 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 				logs.Service.Warn("tls warning", "warning", w)
 			}
 			// A certificate may have appeared on a fresh install:
-			// re-evaluate the STARTTLS offer.
-			if smtpSrv != nil {
-				smtpSrv.Update(smtpSettings(mgr.Get(), store))
-			}
+			// re-evaluate the STARTTLS offer. Limiters are kept, so
+			// quotas are not reset by the periodic refresh.
+			updateAll(mgr.Get(), limits)
 
 		case s := <-sigs:
 			switch s {
@@ -248,38 +340,60 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 				for _, w := range store.Reload(tlsParams(cfg)) {
 					logs.Service.Warn("tls warning", "warning", w)
 				}
-				if smtpSrv != nil {
-					smtpSrv.Update(smtpSettings(cfg, store))
-				}
+				limits = newLimits(cfg)
+				updateAll(cfg, limits)
 				logs.Service.Info("reload complete",
 					"domains", len(cfg.Domains), "tls_loaded", store.Loaded())
 
 			default: // SIGTERM, Interrupt
 				logs.Service.Info("shutdown requested", "signal", s.String())
-				if smtpSrv != nil {
-					smtpSrv.Shutdown(30 * time.Second)
+				close(schedStop)
+				for _, r := range servers {
+					r.srv.Shutdown(30 * time.Second)
 				}
-				logs.Service.Info("stopped")
+				logs.Service.Info("stopped", "queued", q.Size())
 				return nil
 			}
 		}
 	}
 }
 
-// smtpSettings maps the current config onto the SMTP server. STARTTLS
-// is offered only when at least one certificate actually loaded.
-func smtpSettings(cfg *config.Config, store *ktls.Store) smtp.Settings {
+// limitSet holds the shared limiter instances: they live across
+// settings updates so quotas are not reset by a periodic refresh.
+type limitSet struct {
+	in  *ratelimit.Inbound
+	out *ratelimit.Outbound
+}
+
+// newLimits builds the limiters from the current config (fresh
+// instances on SIGHUP reload, since the rates may have changed).
+func newLimits(cfg *config.Config) limitSet {
+	var l limitSet
+	if in := cfg.RateLimit.Inbound; in.IsEnabled() {
+		l.in = ratelimit.NewInbound(
+			in.IP.ConnectionsPerMinute, in.IP.MessagesPerMinute, in.IP.RecipientsPerMinute)
+	}
+	if out := cfg.RateLimit.Outbound; out.IsEnabled() {
+		l.out = ratelimit.NewOutbound(out.User.MessagesPerHour, out.User.RecipientsPerHour)
+	}
+	return l
+}
+
+// smtpSettings maps the current config onto one SMTP listener.
+// STARTTLS is offered only when at least one certificate actually
+// loaded.
+func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implicit bool, lim limitSet) smtp.Settings {
 	set := smtp.Settings{
 		Hostname:      cfg.Server.Hostname,
 		MaxSize:       cfg.SMTP.MaxSize,
 		MaxRecipients: cfg.SMTP.MaxRecipients,
+		Mode:          mode,
+		ImplicitTLS:   implicit,
+		Limits:        lim.in,
+		OutLimits:     lim.out,
 	}
-	if len(store.Loaded()) > 0 {
+	if !implicit && len(store.Loaded()) > 0 {
 		set.TLS = store.Config()
-	}
-	if in := cfg.RateLimit.Inbound; in.IsEnabled() {
-		set.Limits = ratelimit.NewInbound(
-			in.IP.ConnectionsPerMinute, in.IP.MessagesPerMinute, in.IP.RecipientsPerMinute)
 	}
 	return set
 }

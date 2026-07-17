@@ -50,14 +50,33 @@ smtp:
   # Maximum recipients per message.
   max_recipients: 100
 
-# Flood protection (token bucket per source IP, burst = rate).
-# Enabled by default; disable explicitly with enabled: false.
+# Brute force protection for SMTP AUTH: progressive delays, then a
+# temporary lockout of the user and the source IP.
+auth:
+  max_failures: 10
+  lockout_minutes: 15
+
+# Outbound queue (submission relay): exponential retry on 4xx,
+# immediate RFC 3464 bounce on 5xx.
+queue:
+  dir: /var/lib/kavira/queue
+  max_attempts: 10
+
+# Flood protection (token bucket, burst = rate). Enabled by default;
+# disable explicitly with enabled: false.
 rate_limit:
+  # Per source IP, per minute.
   inbound:
     ip:
       connections_per_minute: 30
       messages_per_minute: 100
       recipients_per_minute: 500
+  # Per authenticated user, per hour (compromised account
+  # containment).
+  outbound:
+    user:
+      messages_per_hour: 500
+      recipients_per_hour: 1000
 
 # Hosted mail domains.
 domains:
@@ -72,11 +91,14 @@ domains:
   #     home: /home/ostap
   #     maildir: "{home}/mail"
 
-# Virtual mailboxes.
+# Virtual mailboxes. password_hash enables SMTP submission for the
+# user: generate it with `kavira hash-password` (argon2id; bcrypt
+# hashes are accepted too). Passwords are NEVER stored in clear.
 users:
   - email: admin@example.com
     type: virtual
     maildir: /var/mail/example.com/admin
+    # password_hash: "$argon2id$v=19$m=65536,t=3,p=4$..."
 
 # Administrative HTTPS API. Static API keys only (no JWT):
 #   Authorization: Bearer <key>

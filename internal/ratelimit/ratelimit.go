@@ -1,11 +1,13 @@
-// Package ratelimit implements per-key token buckets for the inbound
-// protections: connections, messages and recipients per source IP.
+// Package ratelimit implements per-key token buckets for the flood
+// protections: inbound per-IP limits (connections, messages,
+// recipients per minute) and outbound per-user limits (messages,
+// recipients per hour).
 //
-// Each key gets a bucket holding up to perMinute tokens (the burst)
-// that refills continuously at perMinute/60 tokens per second: short
-// bursts are absorbed, sustained floods are cut to the configured
-// rate and recover gradually. Idle buckets are pruned opportunistically
-// so the map cannot grow without bound under an address-spraying scan.
+// Each key gets a bucket holding up to limit tokens (the burst) that
+// refills continuously at limit/window: short bursts are absorbed,
+// sustained floods are cut to the configured rate and recover
+// gradually. Idle buckets are pruned opportunistically so the map
+// cannot grow without bound under an address-spraying scan.
 package ratelimit
 
 import (
@@ -18,19 +20,21 @@ type bucket struct {
 	last   time.Time
 }
 
-// Limiter is one token-bucket family keyed by string (an IP).
+// Limiter is one token-bucket family keyed by string (an IP, a user).
 type Limiter struct {
 	mu      sync.Mutex
-	perMin  float64
+	limit   float64
+	window  time.Duration
 	buckets map[string]*bucket
 	now     func() time.Time // injectable for tests
 }
 
-// New returns a Limiter allowing perMinute events per key with a
-// burst of the same size.
-func New(perMinute int) *Limiter {
+// New returns a Limiter allowing limit events per window per key,
+// with a burst of the same size.
+func New(limit int, window time.Duration) *Limiter {
 	return &Limiter{
-		perMin:  float64(perMinute),
+		limit:   float64(limit),
+		window:  window,
 		buckets: make(map[string]*bucket),
 		now:     time.Now,
 	}
@@ -48,12 +52,12 @@ func (l *Limiter) Allow(key string) bool {
 		if len(l.buckets) >= 65536 {
 			l.prune(now)
 		}
-		b = &bucket{tokens: l.perMin, last: now}
+		b = &bucket{tokens: l.limit, last: now}
 		l.buckets[key] = b
 	} else {
-		b.tokens += now.Sub(b.last).Seconds() * l.perMin / 60
-		if b.tokens > l.perMin {
-			b.tokens = l.perMin
+		b.tokens += float64(now.Sub(b.last)) / float64(l.window) * l.limit
+		if b.tokens > l.limit {
+			b.tokens = l.limit
 		}
 		b.last = now
 	}
@@ -68,8 +72,8 @@ func (l *Limiter) Allow(key string) bool {
 // carry no state). Called with the lock held.
 func (l *Limiter) prune(now time.Time) {
 	for k, b := range l.buckets {
-		idle := now.Sub(b.last).Seconds() * l.perMin / 60
-		if b.tokens+idle >= l.perMin {
+		idle := float64(now.Sub(b.last)) / float64(l.window) * l.limit
+		if b.tokens+idle >= l.limit {
 			delete(l.buckets, k)
 		}
 	}
@@ -86,9 +90,9 @@ type Inbound struct {
 // NewInbound builds the inbound limiter set from per-minute values.
 func NewInbound(connsPerMin, msgsPerMin, rcptsPerMin int) *Inbound {
 	return &Inbound{
-		conns: New(connsPerMin),
-		msgs:  New(msgsPerMin),
-		rcpts: New(rcptsPerMin),
+		conns: New(connsPerMin, time.Minute),
+		msgs:  New(msgsPerMin, time.Minute),
+		rcpts: New(rcptsPerMin, time.Minute),
 	}
 }
 
@@ -105,4 +109,29 @@ func (i *Inbound) MsgAllowed(ip string) bool {
 // RcptAllowed reports whether ip may address one more recipient.
 func (i *Inbound) RcptAllowed(ip string) bool {
 	return i == nil || i.rcpts.Allow(ip)
+}
+
+// Outbound bundles the per-user sending limiters (compromised account
+// protection). A nil Outbound allows everything.
+type Outbound struct {
+	msgs  *Limiter
+	rcpts *Limiter
+}
+
+// NewOutbound builds the outbound limiter set from per-hour values.
+func NewOutbound(msgsPerHour, rcptsPerHour int) *Outbound {
+	return &Outbound{
+		msgs:  New(msgsPerHour, time.Hour),
+		rcpts: New(rcptsPerHour, time.Hour),
+	}
+}
+
+// MsgAllowed reports whether user may send one more message.
+func (o *Outbound) MsgAllowed(user string) bool {
+	return o == nil || o.msgs.Allow(user)
+}
+
+// RcptAllowed reports whether user may address one more recipient.
+func (o *Outbound) RcptAllowed(user string) bool {
+	return o == nil || o.rcpts.Allow(user)
 }

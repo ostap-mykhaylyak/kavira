@@ -6,7 +6,7 @@ import (
 )
 
 func TestBurstThenDeny(t *testing.T) {
-	l := New(3)
+	l := New(3, time.Minute)
 	for i := 0; i < 3; i++ {
 		if !l.Allow("1.2.3.4") {
 			t.Fatalf("call %d: want allowed within burst", i)
@@ -22,7 +22,7 @@ func TestBurstThenDeny(t *testing.T) {
 
 func TestRefillOverTime(t *testing.T) {
 	now := time.Unix(0, 0)
-	l := New(60) // 1 token/second
+	l := New(60, time.Minute) // 1 token/second
 	l.now = func() time.Time { return now }
 
 	for i := 0; i < 60; i++ {
