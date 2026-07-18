@@ -14,7 +14,9 @@ server:
   # Maximum concurrent protocol sessions.
   workers: 50
 
-# Empty address disables a listener.
+# Empty address disables a listener. The mail access protocols
+# (submission, IMAP, POP3) refuse to start without a TLS certificate:
+# credentials must never cross a plaintext channel.
 listeners:
   smtp:
     address: ":25"

@@ -32,10 +32,12 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
 	"github.com/ostap-mykhaylyak/kavira/internal/dkim"
+	"github.com/ostap-mykhaylyak/kavira/internal/imap"
 	"github.com/ostap-mykhaylyak/kavira/internal/logging"
 	"github.com/ostap-mykhaylyak/kavira/internal/mailauth"
 	"github.com/ostap-mykhaylyak/kavira/internal/maildir"
 	"github.com/ostap-mykhaylyak/kavira/internal/paths"
+	"github.com/ostap-mykhaylyak/kavira/internal/pop3"
 	"github.com/ostap-mykhaylyak/kavira/internal/proc"
 	"github.com/ostap-mykhaylyak/kavira/internal/queue"
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
@@ -359,9 +361,113 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		servers = append(servers, running{srv, sp.mode, sp.implicit})
 		logs.Service.Info("listening", "protocol", sp.name, "address", sp.addr, "mode", int(sp.mode))
 	}
+	// --- mail access: IMAP (143/993) and POP3 (110/995) ---
+	// Access protocols authenticate the same accounts as submission
+	// and resolve the mailbox through the same storage rules.
+	accessAuth := func(email, password, ip string) (string, error) {
+		if err := authr.Verify(email, password, ip); err != nil {
+			return "", err
+		}
+		mb, ok := storage.Resolve(mgr.Get(), strings.ToLower(email))
+		if !ok {
+			return "", fmt.Errorf("no mailbox for %s", email)
+		}
+		return mb.Dir, nil
+	}
+
+	var imapServers []struct {
+		srv      *imap.Server
+		implicit bool
+	}
+	for _, sp := range []struct {
+		name     string
+		addr     string
+		implicit bool
+	}{
+		{"imap", cfg.Listeners.IMAP.Address, false},
+		{"imaps", cfg.Listeners.IMAPS.Address, true},
+	} {
+		if sp.addr == "" {
+			continue
+		}
+		if len(store.Loaded()) == 0 {
+			// Same rule as submission: no certificate, no mail access
+			// listener — credentials must never cross in the clear.
+			logs.Service.Warn("imap listener disabled: no TLS certificate loaded",
+				"protocol", sp.name, "address", sp.addr)
+			continue
+		}
+		ln, err := net.Listen("tcp", sp.addr)
+		if err != nil {
+			return fmt.Errorf("%s listener %s: %w", sp.name, sp.addr, err)
+		}
+		if sp.implicit {
+			ln = stdtls.NewListener(ln, store.Config())
+		}
+		srv := imap.New(imapSettings(cfg, store, sp.implicit),
+			imap.Backend{Authenticate: accessAuth}, cfg.Server.Workers, logs.Service)
+		go func(name string) {
+			if err := srv.Serve(ln); err != nil {
+				logs.Service.Error("imap server failed", "protocol", name, "error", err.Error())
+			}
+		}(sp.name)
+		imapServers = append(imapServers, struct {
+			srv      *imap.Server
+			implicit bool
+		}{srv, sp.implicit})
+		logs.Service.Info("listening", "protocol", sp.name, "address", sp.addr)
+	}
+
+	var pop3Servers []struct {
+		srv      *pop3.Server
+		implicit bool
+	}
+	for _, sp := range []struct {
+		name     string
+		addr     string
+		implicit bool
+	}{
+		{"pop3", cfg.Listeners.POP3.Address, false},
+		{"pop3s", cfg.Listeners.POP3S.Address, true},
+	} {
+		if sp.addr == "" {
+			continue
+		}
+		if len(store.Loaded()) == 0 {
+			logs.Service.Warn("pop3 listener disabled: no TLS certificate loaded",
+				"protocol", sp.name, "address", sp.addr)
+			continue
+		}
+		ln, err := net.Listen("tcp", sp.addr)
+		if err != nil {
+			return fmt.Errorf("%s listener %s: %w", sp.name, sp.addr, err)
+		}
+		if sp.implicit {
+			ln = stdtls.NewListener(ln, store.Config())
+		}
+		srv := pop3.New(pop3Settings(cfg, store, sp.implicit),
+			pop3.Backend{Authenticate: accessAuth}, cfg.Server.Workers, logs.Service)
+		go func(name string) {
+			if err := srv.Serve(ln); err != nil {
+				logs.Service.Error("pop3 server failed", "protocol", name, "error", err.Error())
+			}
+		}(sp.name)
+		pop3Servers = append(pop3Servers, struct {
+			srv      *pop3.Server
+			implicit bool
+		}{srv, sp.implicit})
+		logs.Service.Info("listening", "protocol", sp.name, "address", sp.addr)
+	}
+
 	updateAll := func(cfg *config.Config, lim limitSet) {
 		for _, r := range servers {
 			r.srv.Update(smtpSettings(cfg, store, r.mode, r.implicit, lim))
+		}
+		for _, r := range imapServers {
+			r.srv.Update(imapSettings(cfg, store, r.implicit))
+		}
+		for _, r := range pop3Servers {
+			r.srv.Update(pop3Settings(cfg, store, r.implicit))
 		}
 	}
 
@@ -411,6 +517,12 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 				for _, r := range servers {
 					r.srv.Shutdown(30 * time.Second)
 				}
+				for _, r := range imapServers {
+					r.srv.Shutdown(30 * time.Second)
+				}
+				for _, r := range pop3Servers {
+					r.srv.Shutdown(30 * time.Second)
+				}
 				logs.Service.Info("stopped", "queued", q.Size())
 				return nil
 			}
@@ -451,6 +563,31 @@ func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implici
 		ImplicitTLS:   implicit,
 		Limits:        lim.in,
 		OutLimits:     lim.out,
+	}
+	if !implicit && len(store.Loaded()) > 0 {
+		set.TLS = store.Config()
+	}
+	return set
+}
+
+// imapSettings maps the config onto one IMAP listener.
+func imapSettings(cfg *config.Config, store *ktls.Store, implicit bool) imap.Settings {
+	set := imap.Settings{
+		Hostname:    cfg.Server.Hostname,
+		ImplicitTLS: implicit,
+		MaxSize:     cfg.SMTP.MaxSize,
+	}
+	if !implicit && len(store.Loaded()) > 0 {
+		set.TLS = store.Config()
+	}
+	return set
+}
+
+// pop3Settings maps the config onto one POP3 listener.
+func pop3Settings(cfg *config.Config, store *ktls.Store, implicit bool) pop3.Settings {
+	set := pop3.Settings{
+		Hostname:    cfg.Server.Hostname,
+		ImplicitTLS: implicit,
 	}
 	if !implicit && len(store.Loaded()) > 0 {
 		set.TLS = store.Config()

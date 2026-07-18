@@ -12,7 +12,18 @@ startup error, not a warning.
 
 ## Status
 
-**M3 — SPF, DKIM, DMARC** (current): inbound pipeline on port 25 —
+**M4 — IMAP and POP3** (current): IMAP4rev1 (RFC 3501) on 143
+(STARTTLS) and 993, with IDLE (RFC 2177), UIDPLUS and MOVE
+(RFC 6851): SELECT/EXAMINE, FETCH (ENVELOPE, BODY[…] sections,
+HEADER.FIELDS, peek semantics), STORE, SEARCH, COPY, APPEND, EXPUNGE,
+LIST/STATUS/CREATE/DELETE. POP3 (RFC 1939) on 110 (STLS) and 995 with
+USER/PASS, STAT, LIST, UIDL, RETR, TOP, DELE, RSET — deletions applied
+only at QUIT, as the UPDATE state requires. Both refuse credentials on
+a plaintext channel (IMAP advertises LOGINDISABLED) and neither
+listener starts without a certificate. Messages carry stable UIDs and
+a persisted UIDVALIDITY; Maildir flags map onto IMAP system flags.
+
+**M3 — SPF, DKIM, DMARC**: inbound pipeline on port 25 —
 SPF (RFC 7208, full evaluation incl. macros), DKIM verification
 (RFC 6376), DMARC (RFC 7489) with relaxed/strict alignment on the
 organizational domain (public suffix list). Every message gets an
@@ -47,7 +58,7 @@ wildcard certificate store, CLI, systemd unit.
 | M1 | SMTP inbound (25), anti-relay, Maildir delivery, inbound rate limit | done |
 | M2 | AUTH, submission (465/587), outbound queue, retry, bounce | done |
 | M3 | SPF, DKIM (sign+verify), DMARC | done |
-| M4 | IMAP4rev1 (IDLE), POP3 | |
+| M4 | IMAP4rev1 (IDLE), POP3 | done |
 | M5 | antispam, reputation, warm-up, blacklist monitoring, API, metrics | |
 | M6 | LXD/LXC container identity, security-check, audit | |
 
@@ -111,6 +122,18 @@ domain suffix (so `studenti.ente.it` wins over `ente.it` when both are
 configured). TLS floor is 1.2 (configurable to 1.3); SSLv3/1.0/1.1 are
 never offered. Renewed certificates are picked up on `kavira reload`
 and automatically every 12 hours.
+
+## Mail access
+
+Mailboxes are plain Maildirs, readable by any standard tool. IMAP
+folders follow the Maildir++ convention: `INBOX` is the account root,
+every other folder is a `.` prefixed subdirectory (`.Sent`,
+`.Spam`, …), and the hierarchy delimiter is `.`.
+
+Each folder keeps a `kavira-uidlist` file mapping the message's stable
+Maildir name to its IMAP UID, plus the mailbox UIDVALIDITY. Losing or
+corrupting that file is safe: kavira mints a fresh UIDVALIDITY, which
+tells clients to resynchronize instead of trusting a stale cache.
 
 ## Logging
 
