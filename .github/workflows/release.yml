@@ -56,11 +56,13 @@ jobs:
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o "dist/kavira-${VERSION}-linux-${arch}" ./cmd/kavira
           done
-          # Ship the unit file and the sample configuration alongside
+          # Ship the unit file and both sample configurations alongside
           # the binary: an operator should not have to clone the repo
-          # to install the service.
+          # to install the service, and since domains live in their own
+          # files the domain example is part of a working setup.
           cp internal/bootstrap/kavira.service dist/
           cp internal/bootstrap/skel/etc/kavira/config.yaml dist/config.yaml.example
+          cp internal/bootstrap/skel/etc/kavira/domains/example.com.yaml dist/domain.yaml.example
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: verify the built binary runs
@@ -90,6 +92,16 @@ jobs:
             echo
             echo "Verify the download against \`SHA256SUMS\`."
             echo
+
+            # The tag annotation is where release-specific context gets
+            # written — breaking changes, migration steps. Losing it
+            # here would mean an operator upgrading never sees it.
+            annotation=$(git tag -l --format='%(contents:body)' "${VERSION}")
+            if [ -n "$(echo "$annotation" | tr -d '[:space:]')" ]; then
+              echo "$annotation"
+              echo
+            fi
+
             echo "### Changes"
             echo
             # Everything since the previous tag; falls back to the
