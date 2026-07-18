@@ -3,6 +3,7 @@ package checks
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -36,6 +37,25 @@ users:
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Recreate the layout with the modes `make install` uses: the
+	// audit checks permissions, so testing it against whatever
+	// t.TempDir() happens to produce (0755 under a default umask)
+	// tests the test framework, not kavira.
+	for _, d := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{cfg.Queue.Dir, 0o750},
+		{cfg.DKIM.Dir, 0o700},
+	} {
+		if err := os.MkdirAll(d.path, d.mode); err != nil {
+			t.Fatal(err)
+		}
+		// MkdirAll applies the umask; set the mode explicitly.
+		if err := os.Chmod(d.path, d.mode); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return cfg, path
 }
@@ -122,6 +142,57 @@ func TestAuditReportsUsersWithoutPassword(t *testing.T) {
 	}
 	if !strings.Contains(res.Detail, "1 of 2") {
 		t.Errorf("detail should count the users: %q", res.Detail)
+	}
+}
+
+func TestAuditFlagsWidePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions are not meaningful on this platform")
+	}
+	cfg, path := testConfig(t)
+
+	// A world-readable queue exposes everyone's mail in transit.
+	if err := os.Chmod(cfg.Queue.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := Audit(cfg, path)
+	res, ok := find(r, "queue directory")
+	if !ok || res.Status != Fail {
+		t.Fatalf("a 0755 queue directory must fail: %+v", res)
+	}
+	if !strings.Contains(res.Fix, "chmod") {
+		t.Errorf("the remedy should be actionable: %q", res.Fix)
+	}
+
+	// A DKIM private key readable beyond its owner lets anyone sign
+	// as the domain: the one secret whose leak is unrecoverable.
+	keyDir := filepath.Join(cfg.DKIM.Dir, "example.com")
+	if err := os.MkdirAll(keyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(keyDir, "default.pem")
+	if err := os.WriteFile(keyPath, []byte("-----BEGIN PRIVATE KEY-----\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = Audit(cfg, path)
+	res, ok = find(r, "dkim keys")
+	if !ok || res.Status != Fail {
+		t.Fatalf("a 0644 DKIM key must fail: %+v", res)
+	}
+
+	// And the same layout with correct modes must pass.
+	if err := os.Chmod(cfg.Queue.Dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r = Audit(cfg, path)
+	if res, _ := find(r, "queue directory"); res.Status != Pass {
+		t.Errorf("a 0750 queue directory should pass: %+v", res)
+	}
+	if res, _ := find(r, "dkim keys"); res.Status != Pass {
+		t.Errorf("a 0600 DKIM key should pass: %+v", res)
 	}
 }
 

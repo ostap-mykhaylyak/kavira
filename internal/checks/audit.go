@@ -178,9 +178,14 @@ func auditPermissions(r *Report, cfg *config.Config, cfgPath string) {
 		r.Pass(s, name, fmt.Sprintf("%s is mode %04o", path, mode))
 	}
 
+	// Only paths kavira creates and owns are checked. Inferring the
+	// state directory from the queue's parent looked tidy but is
+	// wrong the moment an operator points queue.dir at its own
+	// volume, and it would then report on a directory kavira does
+	// not manage.
 	check("config file", cfgPath, 0o640)
-	check("state directory", filepath.Dir(cfg.Queue.Dir), 0o750)
 	check("queue directory", cfg.Queue.Dir, 0o750)
+	check("dkim directory", cfg.DKIM.Dir, 0o700)
 
 	// DKIM private keys are the one secret whose leak lets anyone
 	// sign as the domain: they must not be group readable either.
