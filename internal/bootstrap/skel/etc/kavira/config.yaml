@@ -131,6 +131,19 @@ reputation:
     day7: 2000
     full_per_day: 50000
 
+# LXD/LXC deployment. From the outside kavira must look installed on
+# the metal: the banner and every trace header carry server.hostname
+# and public_ip, never the container name or an address from the
+# internal bridge. Verify with: kavira container-check
+container:
+  enabled: false
+  type: lxd
+  # The address the world reaches this server on. It replaces
+  # internal addresses in outgoing trace headers.
+  public_ip: "203.0.113.10"
+  # The container's address on the bridge.
+  internal_ip: "10.1.0.20"
+
 # Flood protection (token bucket, burst = rate). Enabled by default;
 # disable explicitly with enabled: false.
 rate_limit:

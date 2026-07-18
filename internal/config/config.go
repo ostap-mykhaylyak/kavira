@@ -42,6 +42,7 @@ type Config struct {
 	Antivirus  Antivirus  `yaml:"antivirus"`
 	Blacklist  Blacklist  `yaml:"blacklist"`
 	Reputation Reputation `yaml:"reputation"`
+	Container  Container  `yaml:"container"`
 	RateLimit  RateLimit  `yaml:"rate_limit"`
 	Domains    []Domain   `yaml:"domains"`
 	Users      []User     `yaml:"users"`
@@ -209,6 +210,20 @@ type WarmUp struct {
 	Day1       uint64 `yaml:"day1"`
 	Day7       uint64 `yaml:"day7"`
 	FullPerDay uint64 `yaml:"full_per_day"`
+}
+
+// Container describes an LXD/LXC deployment. From the outside the
+// server must look installed on the metal: the public identity comes
+// from server.hostname and public_ip, never from the container.
+type Container struct {
+	Enabled bool `yaml:"enabled"`
+	// Type is informational: lxd, lxc, docker.
+	Type string `yaml:"type"`
+	// PublicIP is the address the world reaches this server on. It
+	// replaces internal addresses in outgoing trace headers.
+	PublicIP string `yaml:"public_ip"`
+	// InternalIP is the container's address on the bridge.
+	InternalIP string `yaml:"internal_ip"`
 }
 
 // RateLimit configures the flood protections.
@@ -574,6 +589,23 @@ func (c *Config) validate() error {
 			if !(w.Day1 <= w.Day7 && w.Day7 <= w.FullPerDay) {
 				return fmt.Errorf("reputation.warmup: the ramp must grow (day1 <= day7 <= full_per_day)")
 			}
+		}
+	}
+
+	// --- container ---
+	if c.Container.Enabled {
+		if c.Container.PublicIP == "" {
+			return fmt.Errorf("container.enabled requires container.public_ip: without it kavira cannot keep internal addresses out of trace headers")
+		}
+		if net.ParseIP(c.Container.PublicIP) == nil {
+			return fmt.Errorf("container.public_ip %q: not a valid IP address", c.Container.PublicIP)
+		}
+		if c.Container.InternalIP != "" && net.ParseIP(c.Container.InternalIP) == nil {
+			return fmt.Errorf("container.internal_ip %q: not a valid IP address", c.Container.InternalIP)
+		}
+		if ip := net.ParseIP(c.Container.PublicIP); ip != nil && (ip.IsPrivate() || ip.IsLoopback()) {
+			c.warnf("container.public_ip %s is a private address: outgoing mail will still carry an internal address",
+				c.Container.PublicIP)
 		}
 	}
 

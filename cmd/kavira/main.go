@@ -34,7 +34,9 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/auth"
 	"github.com/ostap-mykhaylyak/kavira/internal/blacklist"
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
+	"github.com/ostap-mykhaylyak/kavira/internal/checks"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
+	"github.com/ostap-mykhaylyak/kavira/internal/container"
 	"github.com/ostap-mykhaylyak/kavira/internal/dkim"
 	"github.com/ostap-mykhaylyak/kavira/internal/imap"
 	"github.com/ostap-mykhaylyak/kavira/internal/logging"
@@ -143,7 +145,28 @@ func main() {
 			domain, *selector, name, value)
 
 	case "security-check", "audit", "container-check":
-		notYet(cmd, "M6")
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		cfgPath := fs.String("config", paths.ConfigFile, "config file")
+		probeHost := fs.String("host", "", "address to probe instead of server.hostname (security-check)")
+		fs.Parse(args)
+
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config error:", err)
+			os.Exit(1)
+		}
+		var report *checks.Report
+		var title string
+		switch cmd {
+		case "security-check":
+			report, title = checks.SecurityCheck(cfg, *probeHost), "kavira security check"
+		case "audit":
+			report, title = checks.Audit(cfg, *cfgPath), "kavira configuration audit"
+		default:
+			report, title = checks.ContainerCheck(cfg), "kavira container check"
+		}
+		report.Print(os.Stdout, title)
+		os.Exit(report.ExitCode())
 
 	default:
 		fmt.Fprintf(os.Stderr, "kavira: unknown command %q\n\n", cmd)
@@ -165,8 +188,10 @@ Commands:
 
   generate-dkim  create a domain's DKIM key, print the DNS record
 
-Planned:
-  security-check audit container-check
+Diagnostics (exit 1 when a check fails):
+  audit           inspect the local configuration and filesystem, no network
+  security-check  probe the live deployment: relay, TLS, DNS, rDNS, blacklists
+  container-check verify the public identity of a containerized deployment
 `)
 }
 
@@ -217,6 +242,22 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	logs.Service.Info("starting", "version", version, "config", cfgPath, "pid", os.Getpid())
 	for _, w := range cfg.Warnings {
 		logs.Service.Warn("config warning", "warning", w)
+	}
+
+	// Public identity: nothing kavira writes may carry the container's
+	// own name, including the host part of Maildir filenames.
+	maildir.SetHostname(cfg.Server.Hostname)
+	if leaks, why := container.LeaksContainerName(cfg.Server.Hostname); leaks {
+		logs.Service.Warn("server.hostname is not a public mail hostname",
+			"hostname", cfg.Server.Hostname, "reason", why)
+	}
+	if rt := container.Detect(); rt != container.RuntimeNone {
+		logs.Service.Info("container runtime detected",
+			"runtime", string(rt), "container_mode", cfg.Container.Enabled)
+		if !cfg.Container.Enabled {
+			logs.Service.Warn("running in a container without container mode: internal addresses may reach outgoing mail",
+				"runtime", string(rt))
+		}
 	}
 
 	if err := proc.WritePidfile(pidfile); err != nil {
@@ -775,6 +816,12 @@ func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implici
 		ImplicitTLS:   implicit,
 		Limits:        lim.in,
 		OutLimits:     lim.out,
+		Identity: container.Identity{
+			Enabled:    cfg.Container.Enabled,
+			Hostname:   cfg.Server.Hostname,
+			PublicIP:   cfg.Container.PublicIP,
+			InternalIP: cfg.Container.InternalIP,
+		},
 	}
 	if !implicit && len(store.Loaded()) > 0 {
 		set.TLS = store.Config()

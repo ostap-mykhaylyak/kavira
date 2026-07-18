@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ostap-mykhaylyak/kavira/internal/container"
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 )
@@ -58,6 +59,9 @@ type Settings struct {
 	// OutLimits is the per-user outbound limiter set (submission);
 	// nil disables it.
 	OutLimits *ratelimit.Outbound
+	// Identity keeps internal addresses out of the trace headers of
+	// mail that leaves the server (containerized deployments).
+	Identity container.Identity
 }
 
 // ScreenAction is the verdict of the inbound authentication pipeline.

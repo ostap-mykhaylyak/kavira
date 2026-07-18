@@ -12,7 +12,19 @@ startup error, not a warning.
 
 ## Status
 
-**M5 — antispam, reputation, admin API** (current): a Bayesian
+**M6 — containers and diagnostics** (current): an LXD/LXC deployment
+is indistinguishable from one on the metal — the banner, the EHLO
+name, the trace headers and even the Maildir filenames carry the
+configured public identity, and internal source addresses are
+replaced by `container.public_ip` in outgoing headers while public
+ones stay traceable. Three diagnostic commands: `audit` (local
+configuration and file permissions, no network), `security-check`
+(a real open-relay attempt against the running server, TLS, MX/SPF/
+DKIM/DMARC with the published key compared to the local one, reverse
+DNS, blacklists) and `container-check`. All three exit non-zero on
+failure, so they drop straight into monitoring.
+
+**M5 — antispam, reputation, admin API**: a Bayesian
 classifier trained on the operator's own corpus (persisted, combined
 in log space so long messages cannot underflow) plus heuristics over
 headers, links and attachments; executable attachments are refused
@@ -76,7 +88,7 @@ wildcard certificate store, CLI, systemd unit.
 | M3 | SPF, DKIM (sign+verify), DMARC | done |
 | M4 | IMAP4rev1 (IDLE), POP3 | done |
 | M5 | antispam, reputation, warm-up, blacklist monitoring, API | done (metrics deferred) |
-| M6 | LXD/LXC container identity, security-check, audit | |
+| M6 | LXD/LXC container identity, security-check, audit | done |
 
 ## Build
 
@@ -113,7 +125,16 @@ kavira generate-dkim   create a domain's DKIM key, print the DNS record
 kavira version         print version and exit
 ```
 
-Planned: `security-check`, `audit`, `container-check` (M6).
+```
+kavira audit            local config and permissions, no network
+kavira security-check   probe the live deployment (relay, TLS, DNS, rDNS)
+kavira container-check  verify a containerized deployment's public identity
+```
+
+The diagnostics exit 1 when a check fails (warnings alone do not), so
+they can be wired into monitoring directly. `security-check` needs the
+daemon running; `--host` points the probe somewhere other than
+`server.hostname`, which is what you want during installation.
 
 ## Configuration
 
@@ -150,6 +171,32 @@ Each folder keeps a `kavira-uidlist` file mapping the message's stable
 Maildir name to its IMAP UID, plus the mailbox UIDVALIDITY. Losing or
 corrupting that file is safe: kavira mints a fresh UIDVALIDITY, which
 tells clients to resynchronize instead of trusting a stale cache.
+
+## Running in a container
+
+Kavira is meant to be indistinguishable from a server on the metal.
+Set `server.hostname` to the public FQDN — never the container's own
+name — and declare the addresses:
+
+```yaml
+container:
+  enabled: true
+  type: lxd
+  public_ip: "203.0.113.10"
+  internal_ip: "10.1.0.20"
+```
+
+With this in place, a source address on the internal bridge (a webmail
+submitting through kavira, for instance) is recorded in trace headers
+as the public IP, so relayed mail never carries the host's private
+topology. Public sender addresses are left untouched: the real origin
+of inbound mail stays traceable. `kavira container-check` verifies all
+of it, including that the hostname is not something like
+`container01.lxd`.
+
+Kavira takes no backups of its own. Snapshot the mail storage, the
+queue and the DKIM keys with LXD or ZFS snapshots, and keep a copy of
+the configuration.
 
 ## Administrative API
 

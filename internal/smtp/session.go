@@ -576,13 +576,20 @@ func (s *session) assemble(body, extra []byte) []byte {
 	if s.authed != "" {
 		with = "ESMTPSA"
 	}
+	// The recorded source address is masked when it belongs to the
+	// internal network of a containerized deployment: a message
+	// relayed onward must not carry the host's private topology
+	// (a webmail on the bridge submitting through kavira is the
+	// common case). Public addresses pass through unchanged.
+	source := set.Identity.MaskIP(s.ip)
+
 	var b bytes.Buffer
 	// Authentication-Results goes above our own Received, the
 	// convention every major MTA follows: a reader walking down from
 	// the top meets our verdict before the hop it describes.
 	b.Write(extra) // already CRLF-terminated, empty when not screening
 	fmt.Fprintf(&b, "Received: from %s (%s)\r\n\tby %s (Kavira) with %s",
-		s.helo, s.ip, set.Hostname, with)
+		s.helo, source, set.Hostname, with)
 	// The for clause names the recipient only when there is exactly
 	// one: with several, disclosing the full list to each of them
 	// would leak the envelope.
