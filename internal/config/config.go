@@ -33,8 +33,10 @@ type Config struct {
 	Listeners Listeners `yaml:"listeners"`
 	TLS       TLS       `yaml:"tls"`
 	SMTP      SMTP      `yaml:"smtp"`
+	MailAuth  MailAuth  `yaml:"mail_auth"`
 	Auth      Auth      `yaml:"auth"`
 	Queue     Queue     `yaml:"queue"`
+	DKIM      DKIM      `yaml:"dkim"`
 	RateLimit RateLimit `yaml:"rate_limit"`
 	Domains   []Domain  `yaml:"domains"`
 	Users     []User    `yaml:"users"`
@@ -91,6 +93,22 @@ type SMTP struct {
 	MaxRecipients int `yaml:"max_recipients"`
 }
 
+// MailAuth configures the inbound authentication pipeline (SPF,
+// DKIM, DMARC) on port 25. Both switches default to on.
+type MailAuth struct {
+	// Enabled runs the checks and stamps Authentication-Results.
+	Enabled *bool `yaml:"enabled"`
+	// Enforce applies DMARC reject/quarantine dispositions. When
+	// false, results are only annotated and logged.
+	Enforce *bool `yaml:"enforce"`
+}
+
+// IsEnabled reports whether the pipeline runs at all.
+func (m MailAuth) IsEnabled() bool { return m.Enabled == nil || *m.Enabled }
+
+// IsEnforced reports whether DMARC policies are applied.
+func (m MailAuth) IsEnforced() bool { return m.Enforce == nil || *m.Enforce }
+
 // Auth configures the brute force protections.
 type Auth struct {
 	// MaxFailures locks a user/IP after this many failed attempts.
@@ -105,6 +123,14 @@ type Queue struct {
 	Dir string `yaml:"dir"`
 	// MaxAttempts caps transient retries before bouncing.
 	MaxAttempts int `yaml:"max_attempts"`
+}
+
+// DKIM configures outbound signing.
+type DKIM struct {
+	// Dir holds the per-domain signing keys
+	// (<dir>/<domain>/<selector>.pem). Keys are created by
+	// `kavira generate-dkim`.
+	Dir string `yaml:"dir"`
 }
 
 // RateLimit configures the flood protections.
@@ -150,6 +176,18 @@ type IPLimits struct {
 type Domain struct {
 	Name    string  `yaml:"name"`
 	Storage Storage `yaml:"storage"`
+	// DKIMSelector names the signing key; empty means "default".
+	DKIMSelector string `yaml:"dkim_selector"`
+}
+
+// DKIMSelectorFor returns the configured selector of a domain.
+func (c *Config) DKIMSelectorFor(domain string) string {
+	for _, d := range c.Domains {
+		if d.Name == domain {
+			return d.DKIMSelector
+		}
+	}
+	return ""
 }
 
 // Storage describes where a domain's mailboxes live.
@@ -243,6 +281,7 @@ func defaults() *Config {
 			Dir:         paths.QueueDir,
 			MaxAttempts: 10,
 		},
+		DKIM: DKIM{Dir: paths.DKIMDir},
 		RateLimit: RateLimit{
 			Inbound: Inbound{IP: IPLimits{
 				ConnectionsPerMinute: 30,
@@ -377,6 +416,11 @@ func (c *Config) validate() error {
 	}
 	if c.Queue.MaxAttempts <= 0 {
 		return fmt.Errorf("queue.max_attempts: must be positive")
+	}
+
+	// --- dkim ---
+	if c.DKIM.Dir == "" {
+		c.DKIM.Dir = paths.DKIMDir
 	}
 
 	// --- rate_limit ---

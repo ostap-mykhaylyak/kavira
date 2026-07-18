@@ -50,6 +50,15 @@ smtp:
   # Maximum recipients per message.
   max_recipients: 100
 
+# Inbound mail authentication on port 25: SPF (RFC 7208), DKIM
+# verification (RFC 6376), DMARC (RFC 7489). Every message gets an
+# Authentication-Results header. With enforce: true, DMARC p=reject
+# answers 550 and p=quarantine delivers into the Spam folder; with
+# enforce: false results are only annotated and logged.
+mail_auth:
+  enabled: true
+  enforce: true
+
 # Brute force protection for SMTP AUTH: progressive delays, then a
 # temporary lockout of the user and the source IP.
 auth:
@@ -61,6 +70,11 @@ auth:
 queue:
   dir: /var/lib/kavira/queue
   max_attempts: 10
+
+# DKIM signing keys, one per domain: <dir>/<domain>/<selector>.pem.
+# Create them with `kavira generate-dkim <domain>`.
+dkim:
+  dir: /var/lib/kavira/dkim
 
 # Flood protection (token bucket, burst = rate). Enabled by default;
 # disable explicitly with enabled: false.
@@ -78,10 +92,13 @@ rate_limit:
       messages_per_hour: 500
       recipients_per_hour: 1000
 
-# Hosted mail domains.
+# Hosted mail domains. Outbound mail is DKIM-signed automatically
+# once a key exists: `kavira generate-dkim example.com` creates it
+# and prints the DNS TXT record to publish.
 domains:
   - name: example.com
     # Virtual mailboxes: defined in the users list below.
+    # dkim_selector: default
 
   # A domain delivered to a real Linux user:
   # - name: ostap.dev

@@ -29,7 +29,7 @@ func TestTransportDeliversToRealServer(t *testing.T) {
 			}
 			return storage.Mailbox{}, false
 		},
-		Deliver: func(mb storage.Mailbox, msg []byte) error {
+		Deliver: func(mb storage.Mailbox, from string, spam bool, msg []byte) error {
 			_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
 			return err
 		},
@@ -79,7 +79,7 @@ func TestTransportPermanentFromServer(t *testing.T) {
 	backend := smtp.Backend{
 		IsLocalDomain: func(d string) bool { return d == "remote.org" },
 		Lookup:        func(string) (storage.Mailbox, bool) { return storage.Mailbox{}, false },
-		Deliver:       func(storage.Mailbox, []byte) error { return nil },
+		Deliver:       func(storage.Mailbox, string, bool, []byte) error { return nil },
 		Postmaster:    func() string { return "" },
 	}
 	srv := smtp.New(smtp.Settings{

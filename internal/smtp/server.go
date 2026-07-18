@@ -60,6 +60,23 @@ type Settings struct {
 	OutLimits *ratelimit.Outbound
 }
 
+// ScreenAction is the verdict of the inbound authentication pipeline.
+type ScreenAction int
+
+const (
+	ScreenAccept ScreenAction = iota
+	ScreenQuarantine
+	ScreenReject
+)
+
+// ScreenResult carries the verdict and the Authentication-Results
+// header to stamp on the message.
+type ScreenResult struct {
+	Action      ScreenAction
+	Reason      string
+	AuthResults string
+}
+
 // Backend answers the questions the protocol cannot: what is local
 // and where mail ends up. Implementations read the current config on
 // every call, so a SIGHUP reload is picked up per-transaction.
@@ -68,9 +85,9 @@ type Backend struct {
 	IsLocalDomain func(domain string) bool
 	// Lookup resolves a local address to its mailbox.
 	Lookup func(email string) (storage.Mailbox, bool)
-	// Deliver stores the full message (headers already prepended)
-	// into a mailbox.
-	Deliver func(mb storage.Mailbox, msg []byte) error
+	// Deliver stores the message into a mailbox: from is the envelope
+	// sender (Return-Path), spam selects the quarantine folder.
+	Deliver func(mb storage.Mailbox, from string, spam bool, msg []byte) error
 	// Postmaster returns the address behind a bare RCPT
 	// TO:<postmaster>, or "" when none is configured.
 	Postmaster func() string
@@ -81,6 +98,13 @@ type Backend struct {
 	// Enqueue stores an outbound message for a remote recipient
 	// (submission relay path).
 	Enqueue func(from, rcpt string, data []byte) error
+	// Screen runs the inbound authentication pipeline (SPF, DKIM,
+	// DMARC) on port 25. Nil disables screening. data is the raw
+	// message exactly as received, before any locally added header.
+	Screen func(ip, helo, from string, data []byte) ScreenResult
+	// Sign adds the DKIM signature for the sender domain on
+	// submission. Nil (or a domain without a key) sends unsigned.
+	Sign func(fromDomain string, msg []byte) ([]byte, error)
 }
 
 // Server accepts inbound SMTP connections.

@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -30,7 +31,9 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/auth"
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
+	"github.com/ostap-mykhaylyak/kavira/internal/dkim"
 	"github.com/ostap-mykhaylyak/kavira/internal/logging"
+	"github.com/ostap-mykhaylyak/kavira/internal/mailauth"
 	"github.com/ostap-mykhaylyak/kavira/internal/maildir"
 	"github.com/ostap-mykhaylyak/kavira/internal/paths"
 	"github.com/ostap-mykhaylyak/kavira/internal/proc"
@@ -111,7 +114,27 @@ func main() {
 		fmt.Println(h)
 
 	case "generate-dkim":
-		notYet(cmd, "M3")
+		fs := flag.NewFlagSet("generate-dkim", flag.ExitOnError)
+		selector := fs.String("selector", dkim.DefaultSelector, "DKIM selector")
+		dir := fs.String("dir", paths.DKIMDir, "key directory")
+		fs.Parse(args)
+		if fs.NArg() != 1 {
+			fatalIf(fmt.Errorf("usage: kavira generate-dkim [--selector s] [--dir d] <domain>"))
+		}
+		domain := strings.ToLower(fs.Arg(0))
+		name, value, err := dkim.Generate(*dir, domain, *selector)
+		if err != nil {
+			// An existing key is re-displayed, not overwritten.
+			if n, v, terr := dkim.NewStore(*dir).TXTRecord(domain, *selector); terr == nil {
+				fmt.Fprintln(os.Stderr, "kavira:", err)
+				fmt.Printf("\nExisting DNS record:\n\n%s. IN TXT %q\n", n, v)
+				return
+			}
+			fatalIf(err)
+		}
+		fmt.Printf("DKIM key generated for %s (selector %s).\n\nPublish this DNS record:\n\n%s. IN TXT %q\n",
+			domain, *selector, name, value)
+
 	case "security-check", "audit", "container-check":
 		notYet(cmd, "M6")
 
@@ -133,8 +156,10 @@ Commands:
   hash-password  read a password from stdin, print its argon2id hash
   version        print version and exit
 
+  generate-dkim  create a domain's DKIM key, print the DNS record
+
 Planned:
-  generate-dkim security-check audit container-check
+  security-check audit container-check
 `)
 }
 
@@ -235,13 +260,20 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		func(email string) (string, bool) { return mgr.Get().PasswordHashFor(email) },
 		cfg.Auth.MaxFailures, time.Duration(cfg.Auth.LockoutMinutes)*time.Minute)
 
+	dkimStore := dkim.NewStore(cfg.DKIM.Dir)
+
 	backend := smtp.Backend{
 		IsLocalDomain: func(d string) bool { return mgr.Get().HasDomain(d) },
 		Lookup: func(email string) (storage.Mailbox, bool) {
 			return storage.Resolve(mgr.Get(), email)
 		},
-		Deliver: func(mb storage.Mailbox, msg []byte) error {
-			_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
+		Deliver: func(mb storage.Mailbox, from string, spam bool, msg []byte) error {
+			dir := mb.Dir
+			if spam {
+				dir = filepath.Join(dir, ".Spam") // Maildir++ quarantine
+			}
+			full := append([]byte("Return-Path: <"+from+">\r\n"), msg...)
+			_, err := maildir.Deliver(dir, full, mb.UID, mb.GID)
 			return err
 		},
 		Postmaster: func() string {
@@ -252,6 +284,34 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		},
 		Authenticate: authr.Verify,
 		Enqueue:      q.Enqueue,
+		Screen: func(ip, helo, from string, data []byte) smtp.ScreenResult {
+			cfg := mgr.Get()
+			if !cfg.MailAuth.IsEnabled() {
+				return smtp.ScreenResult{}
+			}
+			checker := mailauth.New(cfg.Server.Hostname, cfg.MailAuth.IsEnforced())
+			res := checker.Check(net.ParseIP(ip), helo, from, data)
+			logs.Service.Info("mail authentication",
+				"event", "mail_auth", "protocol", "smtp", "ip", ip, "from", from,
+				"spf", res.SPF, "dkim", res.DKIM, "dmarc", res.DMARC)
+			out := smtp.ScreenResult{Reason: res.Reason, AuthResults: res.AuthResults}
+			switch res.Action {
+			case mailauth.Reject:
+				out.Action = smtp.ScreenReject
+			case mailauth.Quarantine:
+				out.Action = smtp.ScreenQuarantine
+			}
+			return out
+		},
+		Sign: func(fromDomain string, msg []byte) ([]byte, error) {
+			cfg := mgr.Get()
+			sel := cfg.DKIMSelectorFor(fromDomain)
+			signer, ok := dkimStore.Signer(fromDomain, sel)
+			if !ok {
+				return msg, nil // no key: send unsigned
+			}
+			return dkim.Sign(msg, fromDomain, sel, signer)
+		},
 	}
 
 	// --- listeners: 25 inbound, 587 submission, 465 submission TLS ---

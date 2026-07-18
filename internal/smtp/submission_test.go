@@ -71,7 +71,7 @@ func submissionServer(t *testing.T, mailRoot string, mutate func(*Settings)) (ad
 			}
 			return storage.Mailbox{}, false
 		},
-		Deliver: func(mb storage.Mailbox, msg []byte) error {
+		Deliver: func(mb storage.Mailbox, from string, spam bool, msg []byte) error {
 			_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
 			return err
 		},
@@ -249,7 +249,7 @@ func TestAuthRefusedWithoutTLS(t *testing.T) {
 	backend := Backend{
 		IsLocalDomain: func(string) bool { return false },
 		Lookup:        func(string) (storage.Mailbox, bool) { return storage.Mailbox{}, false },
-		Deliver:       func(storage.Mailbox, []byte) error { return nil },
+		Deliver:       func(storage.Mailbox, string, bool, []byte) error { return nil },
 		Postmaster:    func() string { return "" },
 		Authenticate:  authr.Verify,
 		Enqueue:       func(string, string, []byte) error { return nil },

@@ -473,14 +473,55 @@ func (s *session) cmdData() (quit bool) {
 		return false
 	}
 
-	msg := s.assemble(buf.Bytes())
+	body := buf.Bytes()
+	spam := false
+	var authResults []byte
+
+	// Inbound authentication pipeline: SPF/DKIM/DMARC on the raw
+	// message, before any locally added header (DKIM verification
+	// must see the message exactly as the signer's MTA sent it).
+	if set.Mode == ModeInbound && s.srv.backend.Screen != nil {
+		sr := s.srv.backend.Screen(s.ip, s.helo, s.from, body)
+		switch sr.Action {
+		case ScreenReject:
+			s.srv.log.Warn("message rejected by policy",
+				"event", "policy_reject", "protocol", "smtp", "ip", s.ip,
+				"from", s.from, "reason", sr.Reason, "action", "reject")
+			s.resetTransaction()
+			s.reply("550 5.7.1 " + sr.Reason)
+			return false
+		case ScreenQuarantine:
+			s.srv.log.Warn("message quarantined by policy",
+				"event", "policy_quarantine", "protocol", "smtp", "ip", s.ip,
+				"from", s.from, "reason", sr.Reason, "action", "quarantine")
+			spam = true
+		}
+		authResults = []byte(sr.AuthResults)
+	}
+
+	msg := s.assemble(body, authResults)
+
+	// Submission: DKIM-sign with the sender domain's key, when one
+	// exists. Signing failures are logged but do not block the mail.
+	if set.Mode == ModeSubmission && s.srv.backend.Sign != nil {
+		if _, domain, ok := splitAddr(s.from); ok {
+			if signed, err := s.srv.backend.Sign(domain, msg); err == nil {
+				msg = signed
+			} else {
+				s.srv.log.Error("dkim signing failed",
+					"event", "dkim_error", "protocol", "smtp",
+					"user", s.authed, "domain", domain, "error", err.Error())
+			}
+		}
+	}
+
 	accepted := 0
 	for _, r := range s.rcpts {
 		var err error
 		if r.remote {
 			err = s.srv.backend.Enqueue(s.from, r.addr, msg)
 		} else {
-			err = s.srv.backend.Deliver(r.mb, msg)
+			err = s.srv.backend.Deliver(r.mb, s.from, spam, msg)
 		}
 		if err != nil {
 			s.srv.log.Error("delivery failed",
@@ -509,7 +550,9 @@ func (s *session) cmdData() (quit bool) {
 
 // assemble prepends the trace headers to the received body. Only the
 // public hostname appears: never an internal IP or container name.
-func (s *session) assemble(body []byte) []byte {
+// Return-Path is NOT added here: it belongs to final delivery only,
+// never to a message forwarded to another MTA.
+func (s *session) assemble(body, extra []byte) []byte {
 	set := s.set()
 	with := "ESMTP"
 	if s.tls {
@@ -519,7 +562,10 @@ func (s *session) assemble(body []byte) []byte {
 		with = "ESMTPSA"
 	}
 	var b bytes.Buffer
-	fmt.Fprintf(&b, "Return-Path: <%s>\r\n", s.from)
+	// Authentication-Results goes above our own Received, the
+	// convention every major MTA follows: a reader walking down from
+	// the top meets our verdict before the hop it describes.
+	b.Write(extra) // already CRLF-terminated, empty when not screening
 	fmt.Fprintf(&b, "Received: from %s (%s)\r\n\tby %s (Kavira) with %s",
 		s.helo, s.ip, set.Hostname, with)
 	// The for clause names the recipient only when there is exactly

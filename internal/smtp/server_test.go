@@ -41,8 +41,13 @@ func testServer(t *testing.T, mailRoot string, mutate func(*Settings)) string {
 			}
 			return storage.Mailbox{}, false
 		},
-		Deliver: func(mb storage.Mailbox, msg []byte) error {
-			_, err := maildir.Deliver(mb.Dir, msg, mb.UID, mb.GID)
+		Deliver: func(mb storage.Mailbox, from string, spam bool, msg []byte) error {
+			dir := mb.Dir
+			if spam {
+				dir = filepath.Join(dir, ".Spam")
+			}
+			full := append([]byte("Return-Path: <"+from+">\r\n"), msg...)
+			_, err := maildir.Deliver(dir, full, mb.UID, mb.GID)
 			return err
 		},
 		Postmaster: func() string { return "admin@example.com" },
