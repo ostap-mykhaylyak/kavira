@@ -12,7 +12,23 @@ startup error, not a warning.
 
 ## Status
 
-**M4 — IMAP and POP3** (current): IMAP4rev1 (RFC 3501) on 143
+**M5 — antispam, reputation, admin API** (current): a Bayesian
+classifier trained on the operator's own corpus (persisted, combined
+in log space so long messages cannot underflow) plus heuristics over
+headers, links and attachments; executable attachments are refused
+outright and a double extension is flagged as the disguise it is.
+ClamAV over its socket (INSTREAM, no temp files): a virus is never
+delivered, not even quarantined. DNSBL for connecting IPs and URIBL
+for body links, cached and ignoring answers outside 127.0.0.0/8 so a
+hijacking resolver cannot condemn every sender. Outbound reputation
+per user and domain (0..100, decaying toward the baseline) with a
+warm-up ramp that caps a new domain's daily volume. Administrative
+HTTPS API with static API keys only — constant-time comparison, rate
+limited, never exposing password material, and `/health` as the sole
+unauthenticated endpoint. Prometheus metrics are deliberately not
+implemented yet.
+
+**M4 — IMAP and POP3**: IMAP4rev1 (RFC 3501) on 143
 (STARTTLS) and 993, with IDLE (RFC 2177), UIDPLUS and MOVE
 (RFC 6851): SELECT/EXAMINE, FETCH (ENVELOPE, BODY[…] sections,
 HEADER.FIELDS, peek semantics), STORE, SEARCH, COPY, APPEND, EXPUNGE,
@@ -59,7 +75,7 @@ wildcard certificate store, CLI, systemd unit.
 | M2 | AUTH, submission (465/587), outbound queue, retry, bounce | done |
 | M3 | SPF, DKIM (sign+verify), DMARC | done |
 | M4 | IMAP4rev1 (IDLE), POP3 | done |
-| M5 | antispam, reputation, warm-up, blacklist monitoring, API, metrics | |
+| M5 | antispam, reputation, warm-up, blacklist monitoring, API | done (metrics deferred) |
 | M6 | LXD/LXC container identity, security-check, audit | |
 
 ## Build
@@ -134,6 +150,36 @@ Each folder keeps a `kavira-uidlist` file mapping the message's stable
 Maildir name to its IMAP UID, plus the mailbox UIDVALIDITY. Losing or
 corrupting that file is safe: kavira mints a fresh UIDVALIDITY, which
 tells clients to resynchronize instead of trusting a stale cache.
+
+## Administrative API
+
+HTTPS with static API keys (no JWT), presented as
+`Authorization: Bearer <key>` or `X-API-Key: <key>`:
+
+```
+GET  /health              liveness, no authentication
+GET  /api/v1/status       version, uptime, domain/user counts, queue depth
+GET  /api/v1/domains      configured domains
+GET  /api/v1/users        mailboxes (never any password material)
+GET  /api/v1/reputation   sender scores, worst first
+POST /api/v1/reload       re-read the configuration
+```
+
+Enabling the API without keys is a startup error, and the listener
+does not start without a certificate.
+
+## Spam filtering
+
+The Bayesian classifier starts with no opinion and stays silent until
+it has seen at least 20 ham and 20 spam messages — an untrained filter
+guessing from a handful of examples is worse than no filter. Train it
+by feeding messages through the corpus file at `antispam.bayes_file`.
+
+Scores drive three escalating thresholds (`tag_score` ≤
+`quarantine_score` ≤ `reject_score`; the config refuses any other
+order): tag stamps `X-Spam-Status`, quarantine delivers into `.Spam`,
+reject answers 550 at DATA. Executable attachments and confirmed
+malware bypass the score entirely and are refused outright.
 
 ## Logging
 

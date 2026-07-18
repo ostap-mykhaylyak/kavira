@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ostap-mykhaylyak/kavira/internal/blacklist"
 	"github.com/ostap-mykhaylyak/kavira/internal/paths"
 	"gopkg.in/yaml.v3"
 )
@@ -29,19 +30,23 @@ const (
 
 // Config is the root of /etc/kavira/config.yaml.
 type Config struct {
-	Server    Server    `yaml:"server"`
-	Listeners Listeners `yaml:"listeners"`
-	TLS       TLS       `yaml:"tls"`
-	SMTP      SMTP      `yaml:"smtp"`
-	MailAuth  MailAuth  `yaml:"mail_auth"`
-	Auth      Auth      `yaml:"auth"`
-	Queue     Queue     `yaml:"queue"`
-	DKIM      DKIM      `yaml:"dkim"`
-	RateLimit RateLimit `yaml:"rate_limit"`
-	Domains   []Domain  `yaml:"domains"`
-	Users     []User    `yaml:"users"`
-	API       API       `yaml:"api"`
-	Log       Log       `yaml:"log"`
+	Server     Server     `yaml:"server"`
+	Listeners  Listeners  `yaml:"listeners"`
+	TLS        TLS        `yaml:"tls"`
+	SMTP       SMTP       `yaml:"smtp"`
+	MailAuth   MailAuth   `yaml:"mail_auth"`
+	Auth       Auth       `yaml:"auth"`
+	Queue      Queue      `yaml:"queue"`
+	DKIM       DKIM       `yaml:"dkim"`
+	Antispam   Antispam   `yaml:"antispam"`
+	Antivirus  Antivirus  `yaml:"antivirus"`
+	Blacklist  Blacklist  `yaml:"blacklist"`
+	Reputation Reputation `yaml:"reputation"`
+	RateLimit  RateLimit  `yaml:"rate_limit"`
+	Domains    []Domain   `yaml:"domains"`
+	Users      []User     `yaml:"users"`
+	API        API        `yaml:"api"`
+	Log        Log        `yaml:"log"`
 
 	// Warnings collects non-fatal findings from validation.
 	Warnings []string `yaml:"-"`
@@ -131,6 +136,79 @@ type DKIM struct {
 	// (<dir>/<domain>/<selector>.pem). Keys are created by
 	// `kavira generate-dkim`.
 	Dir string `yaml:"dir"`
+}
+
+// Antispam configures the scoring engine on inbound mail.
+type Antispam struct {
+	Enabled *bool `yaml:"enabled"`
+	// BayesFile is the on-disk training corpus.
+	BayesFile string `yaml:"bayes_file"`
+	// TagScore stamps X-Spam-Status: Yes at or above this score.
+	TagScore float64 `yaml:"tag_score"`
+	// QuarantineScore delivers into the Spam folder at or above.
+	QuarantineScore float64 `yaml:"quarantine_score"`
+	// RejectScore refuses the message at DATA at or above.
+	RejectScore float64 `yaml:"reject_score"`
+	// RejectExecutables refuses messages carrying an executable
+	// attachment outright, whatever the score.
+	RejectExecutables *bool `yaml:"reject_executables"`
+}
+
+// IsEnabled reports whether inbound scoring runs.
+func (a Antispam) IsEnabled() bool { return a.Enabled == nil || *a.Enabled }
+
+// RejectsExecutables reports whether executable attachments are
+// refused.
+func (a Antispam) RejectsExecutables() bool {
+	return a.RejectExecutables == nil || *a.RejectExecutables
+}
+
+// Antivirus configures the ClamAV connection.
+type Antivirus struct {
+	Enabled bool `yaml:"enabled"`
+	// Socket is a unix socket path or host:port.
+	Socket string `yaml:"socket"`
+	// TimeoutSeconds bounds one scan.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// RejectOnError refuses (4xx) when clamd is unreachable, instead
+	// of delivering unscanned mail.
+	RejectOnError bool `yaml:"reject_on_error"`
+}
+
+// Blacklist configures DNSBL and URIBL lookups.
+type Blacklist struct {
+	Enabled *bool `yaml:"enabled"`
+	// DNSBL zones are queried with the connecting IP.
+	DNSBL []string `yaml:"dnsbl"`
+	// URIBL zones are queried with hostnames found in the body.
+	URIBL []string `yaml:"uribl"`
+	// RejectListed refuses a connection from a listed IP outright.
+	RejectListed bool `yaml:"reject_listed"`
+	// CacheMinutes is how long an answer is cached.
+	CacheMinutes int `yaml:"cache_minutes"`
+}
+
+// IsEnabled reports whether blacklist lookups run.
+func (b Blacklist) IsEnabled() bool { return b.Enabled == nil || *b.Enabled }
+
+// Reputation configures outbound sender scoring and warm-up.
+type Reputation struct {
+	Enabled *bool `yaml:"enabled"`
+	// File persists the scores.
+	File string `yaml:"file"`
+	// WarmUp ramps a new domain's daily sending allowance.
+	WarmUp WarmUp `yaml:"warmup"`
+}
+
+// IsEnabled reports whether reputation tracking runs.
+func (r Reputation) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
+
+// WarmUp is the sending ramp for new domains.
+type WarmUp struct {
+	Enabled    bool   `yaml:"enabled"`
+	Day1       uint64 `yaml:"day1"`
+	Day7       uint64 `yaml:"day7"`
+	FullPerDay uint64 `yaml:"full_per_day"`
 }
 
 // RateLimit configures the flood protections.
@@ -282,6 +360,30 @@ func defaults() *Config {
 			MaxAttempts: 10,
 		},
 		DKIM: DKIM{Dir: paths.DKIMDir},
+		Antispam: Antispam{
+			BayesFile:       paths.StateDir + "/bayes",
+			TagScore:        5,
+			QuarantineScore: 10,
+			RejectScore:     20,
+		},
+		Antivirus: Antivirus{
+			Socket:         "/var/run/clamav/clamd.ctl",
+			TimeoutSeconds: 30,
+		},
+		Blacklist: Blacklist{
+			DNSBL:        blacklist.DefaultDNSBL,
+			URIBL:        blacklist.DefaultURIBL,
+			CacheMinutes: 60,
+		},
+		Reputation: Reputation{
+			File: paths.StateDir + "/reputation.json",
+			WarmUp: WarmUp{
+				Enabled:    true,
+				Day1:       100,
+				Day7:       2000,
+				FullPerDay: 50000,
+			},
+		},
 		RateLimit: RateLimit{
 			Inbound: Inbound{IP: IPLimits{
 				ConnectionsPerMinute: 30,
@@ -421,6 +523,58 @@ func (c *Config) validate() error {
 	// --- dkim ---
 	if c.DKIM.Dir == "" {
 		c.DKIM.Dir = paths.DKIMDir
+	}
+
+	// --- antispam ---
+	if c.Antispam.IsEnabled() {
+		a := &c.Antispam
+		if a.BayesFile == "" {
+			a.BayesFile = paths.StateDir + "/bayes"
+		}
+		if a.TagScore <= 0 || a.QuarantineScore <= 0 || a.RejectScore <= 0 {
+			return fmt.Errorf("antispam: tag_score, quarantine_score and reject_score must be positive")
+		}
+		// The thresholds must escalate, or the milder action can never
+		// be reached and the operator's intent is silently inverted.
+		if !(a.TagScore <= a.QuarantineScore && a.QuarantineScore <= a.RejectScore) {
+			return fmt.Errorf("antispam: thresholds must satisfy tag_score <= quarantine_score <= reject_score (got %.1f, %.1f, %.1f)",
+				a.TagScore, a.QuarantineScore, a.RejectScore)
+		}
+	}
+
+	// --- antivirus ---
+	if c.Antivirus.Enabled {
+		if c.Antivirus.Socket == "" {
+			return fmt.Errorf("antivirus.enabled requires antivirus.socket")
+		}
+		if c.Antivirus.TimeoutSeconds <= 0 {
+			c.Antivirus.TimeoutSeconds = 30
+		}
+	}
+
+	// --- blacklist ---
+	if c.Blacklist.IsEnabled() {
+		if c.Blacklist.CacheMinutes <= 0 {
+			c.Blacklist.CacheMinutes = 60
+		}
+		if len(c.Blacklist.DNSBL) == 0 && len(c.Blacklist.URIBL) == 0 {
+			c.warnf("blacklist enabled but no dnsbl/uribl zones configured: no lookups will happen")
+		}
+	}
+
+	// --- reputation ---
+	if c.Reputation.IsEnabled() {
+		if c.Reputation.File == "" {
+			c.Reputation.File = paths.StateDir + "/reputation.json"
+		}
+		if w := c.Reputation.WarmUp; w.Enabled {
+			if w.Day1 == 0 || w.Day7 == 0 || w.FullPerDay == 0 {
+				return fmt.Errorf("reputation.warmup: day1, day7 and full_per_day must be positive")
+			}
+			if !(w.Day1 <= w.Day7 && w.Day7 <= w.FullPerDay) {
+				return fmt.Errorf("reputation.warmup: the ramp must grow (day1 <= day7 <= full_per_day)")
+			}
+		}
 	}
 
 	// --- rate_limit ---

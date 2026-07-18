@@ -451,6 +451,17 @@ func (s *session) cmdData() (quit bool) {
 			"user", s.authed, "action", "suspend_sending")
 		s.reply("452 4.2.1 sending quota exceeded, try again later")
 		return false
+	} else if s.srv.backend.MaySend != nil {
+		// Reputation and warm-up: a burned sender or a brand-new
+		// domain over its daily ramp is held back here.
+		_, domain, _ := splitAddr(s.authed)
+		if ok, reason := s.srv.backend.MaySend(s.authed, domain); !ok {
+			s.srv.log.Warn("sending refused by reputation",
+				"event", "reputation_block", "protocol", "smtp", "ip", s.ip,
+				"user", s.authed, "reason", reason, "action", "reject")
+			s.reply("450 4.7.1 " + reason)
+			return false
+		}
 	}
 	if err := s.reply("354 end data with <CRLF>.<CRLF>"); err != nil {
 		return true
@@ -496,7 +507,7 @@ func (s *session) cmdData() (quit bool) {
 				"from", s.from, "reason", sr.Reason, "action", "quarantine")
 			spam = true
 		}
-		authResults = []byte(sr.AuthResults)
+		authResults = append([]byte(sr.AuthResults), sr.SpamHeader...)
 	}
 
 	msg := s.assemble(body, authResults)
@@ -539,6 +550,10 @@ func (s *session) cmdData() (quit bool) {
 	event := "message_in"
 	if set.Mode == ModeSubmission {
 		event = "message_submitted"
+		if s.srv.backend.Sent != nil {
+			_, domain, _ := splitAddr(s.authed)
+			s.srv.backend.Sent(s.authed, domain)
+		}
 	}
 	s.srv.log.Info("message accepted",
 		"event", event, "protocol", "smtp", "ip", s.ip, "user", s.authed,

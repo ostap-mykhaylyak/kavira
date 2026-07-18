@@ -69,12 +69,14 @@ const (
 	ScreenReject
 )
 
-// ScreenResult carries the verdict and the Authentication-Results
-// header to stamp on the message.
+// ScreenResult carries the verdict and the headers to stamp on the
+// message.
 type ScreenResult struct {
 	Action      ScreenAction
 	Reason      string
 	AuthResults string
+	// SpamHeader is the X-Spam-Status line, empty when not scored.
+	SpamHeader string
 }
 
 // Backend answers the questions the protocol cannot: what is local
@@ -105,6 +107,13 @@ type Backend struct {
 	// Sign adds the DKIM signature for the sender domain on
 	// submission. Nil (or a domain without a key) sends unsigned.
 	Sign func(fromDomain string, msg []byte) ([]byte, error)
+	// MaySend gates outbound submission on the sender's reputation
+	// and warm-up allowance. It returns a reason when sending is
+	// refused. Nil disables the check.
+	MaySend func(user, domain string) (ok bool, reason string)
+	// Sent reports an accepted submission, so the reputation store
+	// can count it against the daily warm-up cap. Nil disables it.
+	Sent func(user, domain string)
 }
 
 // Server accepts inbound SMTP connections.

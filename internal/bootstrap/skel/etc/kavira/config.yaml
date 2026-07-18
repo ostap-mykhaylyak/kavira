@@ -78,6 +78,59 @@ queue:
 dkim:
   dir: /var/lib/kavira/dkim
 
+# Inbound spam scoring: Bayesian classifier (trained on your own
+# corpus) plus header, link and attachment heuristics. The thresholds
+# must escalate: tag <= quarantine <= reject.
+antispam:
+  enabled: true
+  bayes_file: /var/lib/kavira/bayes
+  # Stamp X-Spam-Status: Yes at or above this score.
+  tag_score: 5
+  # Deliver into the Spam folder at or above.
+  quarantine_score: 10
+  # Refuse the message at DATA at or above.
+  reject_score: 20
+  # Refuse executable attachments outright, whatever the score.
+  reject_executables: true
+
+# ClamAV over its socket. A virus is never delivered, not even
+# quarantined.
+antivirus:
+  enabled: false
+  socket: /var/run/clamav/clamd.ctl
+  timeout_seconds: 30
+  # Refuse (4xx) when clamd is unreachable instead of delivering
+  # unscanned mail.
+  reject_on_error: false
+
+# DNS blacklists: DNSBL for connecting IPs, URIBL for links in the
+# body. Answers are cached to stay within the list operators' limits.
+blacklist:
+  enabled: true
+  dnsbl:
+    - zen.spamhaus.org
+    - b.barracudacentral.org
+    - dnsbl.sorbs.net
+    - dnsbl-1.uceprotect.net
+  uribl:
+    - dbl.spamhaus.org
+    - multi.uribl.com
+  # Refuse a connection from a listed IP outright. Off by default:
+  # start by scoring, turn this on once you trust your lists.
+  reject_listed: false
+  cache_minutes: 60
+
+# Outbound sender reputation and the warm-up ramp for new domains.
+# Scores run 0..100 and decay toward 50 over time.
+reputation:
+  enabled: true
+  file: /var/lib/kavira/reputation.json
+  warmup:
+    enabled: true
+    day1: 100
+    day7: 2000
+    full_per_day: 50000
+
 # Flood protection (token bucket, burst = rate). Enabled by default;
 # disable explicitly with enabled: false.
 rate_limit:
@@ -120,8 +173,11 @@ users:
     # password_hash: "$argon2id$v=19$m=65536,t=3,p=4$..."
 
 # Administrative HTTPS API. Static API keys only (no JWT):
-#   Authorization: Bearer <key>
-# Refuses to start when enabled without keys.
+#   Authorization: Bearer <key>      (or X-API-Key: <key>)
+# Refuses to start when enabled without keys, and never runs without
+# TLS. /health is the only unauthenticated endpoint.
+#   GET  /api/v1/status  /domains  /users  /reputation
+#   POST /api/v1/reload
 api:
   enabled: false
   address: ":8443"

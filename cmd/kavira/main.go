@@ -28,7 +28,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ostap-mykhaylyak/kavira/internal/antispam"
+	"github.com/ostap-mykhaylyak/kavira/internal/antivirus"
+	"github.com/ostap-mykhaylyak/kavira/internal/api"
 	"github.com/ostap-mykhaylyak/kavira/internal/auth"
+	"github.com/ostap-mykhaylyak/kavira/internal/blacklist"
 	"github.com/ostap-mykhaylyak/kavira/internal/bootstrap"
 	"github.com/ostap-mykhaylyak/kavira/internal/config"
 	"github.com/ostap-mykhaylyak/kavira/internal/dkim"
@@ -41,6 +45,7 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/proc"
 	"github.com/ostap-mykhaylyak/kavira/internal/queue"
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
+	"github.com/ostap-mykhaylyak/kavira/internal/reputation"
 	"github.com/ostap-mykhaylyak/kavira/internal/smtp"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 	ktls "github.com/ostap-mykhaylyak/kavira/internal/tls"
@@ -229,6 +234,80 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	logs.Service.Info("tls certificates loaded",
 		"domains", store.Loaded(), "min_version", cfg.TLS.MinVersion)
 
+	// --- authentication (survives reloads: lookup reads mgr.Get()) ---
+	authr := auth.New(
+		func(email string) (string, bool) { return mgr.Get().PasswordHashFor(email) },
+		cfg.Auth.MaxFailures, time.Duration(cfg.Auth.LockoutMinutes)*time.Minute)
+
+	dkimStore := dkim.NewStore(cfg.DKIM.Dir)
+
+	// --- blacklists (DNSBL for IPs, URIBL for body links) ---
+	var bl *blacklist.Checker
+	if cfg.Blacklist.IsEnabled() {
+		bl = blacklist.New(cfg.Blacklist.DNSBL, cfg.Blacklist.URIBL,
+			time.Duration(cfg.Blacklist.CacheMinutes)*time.Minute)
+		logs.Service.Info("blacklists enabled",
+			"dnsbl", len(cfg.Blacklist.DNSBL), "uribl", len(cfg.Blacklist.URIBL),
+			"reject_listed", cfg.Blacklist.RejectListed)
+	}
+
+	// --- antivirus ---
+	var scanner antispam.Scanner
+	if cfg.Antivirus.Enabled {
+		av := antivirus.New(cfg.Antivirus.Socket,
+			time.Duration(cfg.Antivirus.TimeoutSeconds)*time.Second)
+		if err := av.Ping(); err != nil {
+			// Not fatal: clamd may still be starting. Scans will
+			// error until it answers, and reject_on_error decides
+			// what that means for the mail.
+			logs.Service.Warn("clamav not reachable at startup",
+				"socket", cfg.Antivirus.Socket, "error", err.Error())
+		} else {
+			logs.Service.Info("antivirus enabled", "socket", cfg.Antivirus.Socket)
+		}
+		scanner = av
+	}
+
+	// --- antispam ---
+	var spamEngine *antispam.Engine
+	var bayes *antispam.Bayes
+	if cfg.Antispam.IsEnabled() {
+		var err error
+		bayes, err = antispam.NewBayes(cfg.Antispam.BayesFile)
+		if err != nil {
+			logs.Service.Warn("bayes corpus not loaded, starting empty",
+				"file", cfg.Antispam.BayesFile, "error", err.Error())
+			bayes, _ = antispam.NewBayes("")
+		}
+		spamEngine = &antispam.Engine{Bayes: bayes, Scanner: scanner}
+		if bl != nil {
+			spamEngine.URIBL = bl
+		}
+		ham, spam := bayes.Trained()
+		logs.Service.Info("antispam enabled",
+			"bayes_ham", ham, "bayes_spam", spam, "bayes_ready", bayes.Ready(),
+			"tag", cfg.Antispam.TagScore, "quarantine", cfg.Antispam.QuarantineScore,
+			"reject", cfg.Antispam.RejectScore)
+	}
+
+	// --- reputation ---
+	var rep *reputation.Store
+	if cfg.Reputation.IsEnabled() {
+		var err error
+		rep, err = reputation.Open(cfg.Reputation.File)
+		if err != nil {
+			logs.Service.Warn("reputation store not loaded, starting empty",
+				"file", cfg.Reputation.File, "error", err.Error())
+			rep, _ = reputation.Open("")
+		}
+		logs.Service.Info("reputation enabled",
+			"file", cfg.Reputation.File, "warmup", cfg.Reputation.WarmUp.Enabled)
+	}
+	warmUp := func(cfg *config.Config) reputation.WarmUp {
+		w := cfg.Reputation.WarmUp
+		return reputation.WarmUp{Enabled: w.Enabled, Day1: w.Day1, Day7: w.Day7, Full: w.FullPerDay}
+	}
+
 	// --- outbound queue + scheduler ---
 	q, err := queue.Open(cfg.Queue.Dir)
 	if err != nil {
@@ -236,6 +315,14 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	}
 	transport := &queue.SMTPTransport{Hostname: cfg.Server.Hostname}
 	bounceFn := func(e *queue.Envelope, reason string) {
+		// A hard bounce is reputation-relevant: it is the clearest
+		// signal that a sender is mailing addresses it should not.
+		if rep != nil && e.From != "" {
+			rep.Record("user:"+e.From, reputation.EventBounce)
+			if _, domain, ok := storage.Split(e.From); ok {
+				rep.Record("domain:"+domain, reputation.EventBounce)
+			}
+		}
 		data := queue.BuildBounce(mgr.Get().Server.Hostname, e, reason)
 		if data == nil {
 			return // null reverse-path: never bounce a bounce
@@ -257,12 +344,34 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	go sched.Run(schedStop)
 	logs.Service.Info("outbound queue open", "dir", cfg.Queue.Dir, "pending", q.Size())
 
-	// --- authentication (survives reloads: lookup reads mgr.Get()) ---
-	authr := auth.New(
-		func(email string) (string, bool) { return mgr.Get().PasswordHashFor(email) },
-		cfg.Auth.MaxFailures, time.Duration(cfg.Auth.LockoutMinutes)*time.Minute)
-
-	dkimStore := dkim.NewStore(cfg.DKIM.Dir)
+	// --- state persistence: the learned corpus and the scores are
+	// flushed periodically and on shutdown, so a crash loses at most
+	// one interval of learning rather than everything. ---
+	stateStop := make(chan struct{})
+	saveState := func() {
+		if bayes != nil {
+			if err := bayes.Save(); err != nil {
+				logs.Service.Error("bayes save failed", "error", err.Error())
+			}
+		}
+		if rep != nil {
+			if err := rep.Save(); err != nil {
+				logs.Service.Error("reputation save failed", "error", err.Error())
+			}
+		}
+	}
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-stateStop:
+				return
+			case <-t.C:
+				saveState()
+			}
+		}
+	}()
 
 	backend := smtp.Backend{
 		IsLocalDomain: func(d string) bool { return mgr.Get().HasDomain(d) },
@@ -288,22 +397,90 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		Enqueue:      q.Enqueue,
 		Screen: func(ip, helo, from string, data []byte) smtp.ScreenResult {
 			cfg := mgr.Get()
-			if !cfg.MailAuth.IsEnabled() {
-				return smtp.ScreenResult{}
+			var out smtp.ScreenResult
+
+			// --- SPF / DKIM / DMARC ---
+			if cfg.MailAuth.IsEnabled() {
+				checker := mailauth.New(cfg.Server.Hostname, cfg.MailAuth.IsEnforced())
+				res := checker.Check(net.ParseIP(ip), helo, from, data)
+				logs.Service.Info("mail authentication",
+					"event", "mail_auth", "protocol", "smtp", "ip", ip, "from", from,
+					"spf", res.SPF, "dkim", res.DKIM, "dmarc", res.DMARC)
+				out.AuthResults = res.AuthResults
+				out.Reason = res.Reason
+				switch res.Action {
+				case mailauth.Reject:
+					out.Action = smtp.ScreenReject
+					return out // a DMARC reject settles it, no need to score
+				case mailauth.Quarantine:
+					out.Action = smtp.ScreenQuarantine
+				}
 			}
-			checker := mailauth.New(cfg.Server.Hostname, cfg.MailAuth.IsEnforced())
-			res := checker.Check(net.ParseIP(ip), helo, from, data)
-			logs.Service.Info("mail authentication",
-				"event", "mail_auth", "protocol", "smtp", "ip", ip, "from", from,
-				"spf", res.SPF, "dkim", res.DKIM, "dmarc", res.DMARC)
-			out := smtp.ScreenResult{Reason: res.Reason, AuthResults: res.AuthResults}
-			switch res.Action {
-			case mailauth.Reject:
-				out.Action = smtp.ScreenReject
-			case mailauth.Quarantine:
-				out.Action = smtp.ScreenQuarantine
+
+			// --- DNSBL on the connecting IP ---
+			if bl != nil && cfg.Blacklist.RejectListed {
+				if listed, zones := bl.ListedIP(ip); listed {
+					logs.Service.Warn("connection from blacklisted ip",
+						"event", "blacklist_hit", "protocol", "smtp", "ip", ip,
+						"zones", zones, "action", "reject")
+					out.Action = smtp.ScreenReject
+					out.Reason = fmt.Sprintf("your IP is listed on %s", strings.Join(zones, ", "))
+					return out
+				}
+			}
+
+			// --- antispam scoring ---
+			if spamEngine != nil {
+				v := spamEngine.Check(data)
+				out.SpamHeader = v.Header(cfg.Antispam.TagScore)
+				logs.Service.Info("message scored",
+					"event", "spam_score", "protocol", "smtp", "ip", ip, "from", from,
+					"score", v.Score, "bayes", v.Bayes, "rules", v.Rules, "virus", v.Virus)
+
+				switch {
+				case v.Virus != "":
+					// Malware is never delivered, not even quarantined.
+					out.Action = smtp.ScreenReject
+					out.Reason = fmt.Sprintf("message contains %s", v.Virus)
+					return out
+				case v.BadAttachment != "" && cfg.Antispam.RejectsExecutables():
+					out.Action = smtp.ScreenReject
+					out.Reason = fmt.Sprintf("executable attachment refused: %s", v.BadAttachment)
+					return out
+				case v.Score >= cfg.Antispam.RejectScore:
+					out.Action = smtp.ScreenReject
+					out.Reason = fmt.Sprintf("message rejected, spam score %.1f", v.Score)
+					return out
+				case v.Score >= cfg.Antispam.QuarantineScore:
+					out.Action = smtp.ScreenQuarantine
+					if out.Reason == "" {
+						out.Reason = fmt.Sprintf("spam score %.1f", v.Score)
+					}
+				}
 			}
 			return out
+		},
+		MaySend: func(user, domain string) (bool, string) {
+			if rep == nil {
+				return true, ""
+			}
+			if rep.Blocked("user:" + user) {
+				return false, "sending temporarily suspended, contact your administrator"
+			}
+			if rep.Blocked("domain:" + domain) {
+				return false, "domain sending temporarily suspended"
+			}
+			if ok, limit := rep.AllowSend("domain:"+domain, warmUp(mgr.Get())); !ok {
+				return false, fmt.Sprintf("daily sending limit reached (%d), try again tomorrow", limit)
+			}
+			return true, ""
+		},
+		Sent: func(user, domain string) {
+			if rep == nil {
+				return
+			}
+			rep.Record("user:"+user, reputation.EventDelivered)
+			rep.Record("domain:"+domain, reputation.EventDelivered)
 		},
 		Sign: func(fromDomain string, msg []byte) ([]byte, error) {
 			cfg := mgr.Get()
@@ -459,6 +636,36 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		logs.Service.Info("listening", "protocol", sp.name, "address", sp.addr)
 	}
 
+	// --- administrative API (HTTPS, static API keys only) ---
+	var apiSrv *api.Server
+	if cfg.API.Enabled {
+		if len(store.Loaded()) == 0 {
+			// The API carries credentials and mutates state: it never
+			// runs unencrypted.
+			logs.Service.Warn("api disabled: no TLS certificate loaded", "address", cfg.API.Address)
+		} else {
+			apiSrv = api.New(cfg.API.Address, cfg.API.Keys, api.Deps{
+				Config:     mgr.Get,
+				Reload:     mgr.Reload,
+				QueueSize:  q.Size,
+				Reputation: rep,
+				Version:    version,
+				Started:    time.Now(),
+			}, logs.Service)
+			ln, err := net.Listen("tcp", cfg.API.Address)
+			if err != nil {
+				return fmt.Errorf("api listener %s: %w", cfg.API.Address, err)
+			}
+			go func() {
+				if err := apiSrv.Serve(stdtls.NewListener(ln, store.Config())); err != nil {
+					logs.Service.Error("api server failed", "error", err.Error())
+				}
+			}()
+			logs.Service.Info("listening", "protocol", "api", "address", cfg.API.Address,
+				"keys", len(cfg.API.Keys))
+		}
+	}
+
 	updateAll := func(cfg *config.Config, lim limitSet) {
 		for _, r := range servers {
 			r.srv.Update(smtpSettings(cfg, store, r.mode, r.implicit, lim))
@@ -514,6 +721,11 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 			default: // SIGTERM, Interrupt
 				logs.Service.Info("shutdown requested", "signal", s.String())
 				close(schedStop)
+				close(stateStop)
+				saveState()
+				if apiSrv != nil {
+					apiSrv.Shutdown(5 * time.Second)
+				}
 				for _, r := range servers {
 					r.srv.Shutdown(30 * time.Second)
 				}
