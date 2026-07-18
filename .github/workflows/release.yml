@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be re-cut by hand if the artifacts need rebuilding.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build a release for (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # `git describe` needs the full history to name the version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A tag must never ship code that does not pass its own tests.
+      - name: verify
+        run: |
+          test -z "$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
+          go vet ./...
+          go test ./... -race -count=1
+
+      - name: resolve version
+        id: version
+        run: |
+          version="${{ inputs.tag }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $version"
+
+      - name: build static binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/kavira-${VERSION}-linux-${arch}" ./cmd/kavira
+          done
+          # Ship the unit file and the sample configuration alongside
+          # the binary: an operator should not have to clone the repo
+          # to install the service.
+          cp internal/bootstrap/kavira.service dist/
+          cp internal/bootstrap/skel/etc/kavira/config.yaml dist/config.yaml.example
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: verify the built binary runs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./dist/kavira-${VERSION}-linux-amd64 version
+          ./dist/kavira-${VERSION}-linux-amd64 check-config \
+            --config dist/config.yaml.example
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes=$(mktemp)
+          {
+            echo "## kavira ${VERSION}"
+            echo
+            echo "Static, dependency-free binaries for Linux."
+            echo
+            echo '```sh'
+            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/kavira-${VERSION}-linux-amd64"
+            echo "install -m 0755 kavira-${VERSION}-linux-amd64 /usr/sbin/kavira"
+            echo "kavira check-config"
+            echo '```'
+            echo
+            echo "Verify the download against \`SHA256SUMS\`."
+            echo
+            echo "### Changes"
+            echo
+            # Everything since the previous tag; falls back to the
+            # whole history for the first release.
+            previous=$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)
+            if [ -n "$previous" ]; then
+              echo "Since ${previous}:"
+              echo
+              git log --no-merges --pretty='- %s' "${previous}..${VERSION}"
+            else
+              git log --no-merges --pretty='- %s' "${VERSION}"
+            fi
+          } > "$notes"
+          cat "$notes"
+
+          gh release create "${VERSION}" \
+            --title "kavira ${VERSION}" \
+            --notes-file "$notes" \
+            --verify-tag \
+            dist/*

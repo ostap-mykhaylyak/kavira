@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Allow running the suite by hand, e.g. before cutting a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the deployment target; Windows is where development
+        # happens, and the platform-specific files (Maildir flag
+        # separator, signal handling) only diverge there — so both are
+        # worth keeping green.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        shell: bash
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt -s formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The race detector needs a C toolchain, which is reliable on the
+      # Linux runners; Windows runs the plain suite.
+      - name: go test (race)
+        if: runner.os == 'Linux'
+        run: go test ./... -race -count=1
+
+      - name: go test
+        if: runner.os != 'Linux'
+        run: go test ./... -count=1
+
+  build:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The release ships static binaries for both architectures, so a
+      # build break on either must fail the branch, not the release.
+      - name: build linux/amd64 and linux/arm64
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/kavira-amd64 ./cmd/kavira
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/kavira-arm64 ./cmd/kavira
+          file /tmp/kavira-amd64 /tmp/kavira-arm64
+
+      # A binary that cannot validate its own shipped configuration is
+      # broken in a way the unit tests do not catch.
+      - name: smoke test the built binary
+        run: |
+          /tmp/kavira-amd64 version
+          /tmp/kavira-amd64 check-config \
+            --config internal/bootstrap/skel/etc/kavira/config.yaml
+          # audit is expected to report findings here (a checked-out
+          # config has repository permissions, not production ones);
+          # what matters is that it runs to completion.
+          /tmp/kavira-amd64 audit \
+            --config internal/bootstrap/skel/etc/kavira/config.yaml \
+            || test $? -eq 1

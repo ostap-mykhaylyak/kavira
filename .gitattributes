@@ -1,0 +1,11 @@
+# Development happens on Windows, deployment on Linux. Storing every
+# text file with LF keeps the repository identical for both, and stops
+# a CRLF checkout from leaking into a commit — which matters for the
+# shell scripts and the systemd unit, where CRLF is a syntax error.
+* text=auto eol=lf
+
+# Binaries and certificates must never be touched.
+*.pem   binary
+*.png   binary
+*.jpg   binary
+*.gz    binary

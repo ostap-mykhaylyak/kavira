@@ -1,5 +1,7 @@
 # kavira
 
+[![CI](https://github.com/ostap-mykhaylyak/kavira/actions/workflows/ci.yml/badge.svg)](https://github.com/ostap-mykhaylyak/kavira/actions/workflows/ci.yml)
+
 Enterprise secure mail server in Go: a modern, single-binary
 alternative to Postfix + Dovecot + Rspamd, designed for hosting
 providers, multi-domain mail hosting, dedicated servers, VPS and
@@ -102,8 +104,25 @@ make test
 
 ## Install (Linux)
 
+From a release — static binaries, no dependencies:
+
+```sh
+VERSION=v0.1.0
+curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/download/$VERSION/kavira-$VERSION-linux-amd64
+curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/download/$VERSION/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+install -m 0755 kavira-$VERSION-linux-amd64 /usr/sbin/kavira
+```
+
+Or from source:
+
 ```sh
 make install
+```
+
+Then, either way:
+
+```sh
 # review /etc/kavira/config.yaml, then:
 kavira check-config
 systemctl daemon-reload
@@ -112,6 +131,10 @@ systemctl enable --now kavira
 
 On first start without a config, kavira provisions the default layout
 (`/etc/kavira`, `/var/log/kavira`, `/var/lib/kavira`) by itself.
+
+Releases carry `linux-amd64` and `linux-arm64` binaries, the systemd
+unit and a sample configuration; every tag is built by CI only after
+the full test suite passes.
 
 ## CLI
 
