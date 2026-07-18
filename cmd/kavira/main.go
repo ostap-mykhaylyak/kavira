@@ -100,10 +100,34 @@ func main() {
 		for _, w := range cfg.Warnings {
 			fmt.Println("warning:", w)
 		}
-		fmt.Printf("%s: config OK (%d domains, %d users)\n",
-			*cfgPath, len(cfg.Domains), len(cfg.Users))
+		fmt.Printf("%s: config OK\n", *cfgPath)
+		fmt.Printf("domains: %d from %s\n", len(cfg.Domains), cfg.DomainsDir)
+		for _, d := range cfg.Domains {
+			n := 0
+			for _, u := range cfg.Users {
+				if strings.HasSuffix(u.Email, "@"+d.Name) {
+					n++
+				}
+			}
+			storage := d.Storage.Type
+			if storage == "" {
+				storage = config.StorageVirtual
+			}
+			fmt.Printf("  %-30s %-12s %d mailbox(es)\n", d.Name, storage, n)
+		}
 
-	case "version":
+	// Both spellings are accepted: kavira uses subcommands, but the
+	// lifecycle flags read naturally as flags too.
+	case "init", "--init":
+		fatalIf(bootstrap.Init(version, os.Stdout))
+
+	case "purge", "--purge":
+		fs := flag.NewFlagSet("purge", flag.ExitOnError)
+		assumeYes := fs.Bool("yes", false, "skip the confirmation prompt")
+		fs.Parse(args)
+		fatalIf(bootstrap.Purge(*assumeYes, os.Stdin, os.Stdout))
+
+	case "version", "--version":
 		fmt.Println("kavira", version)
 
 	case "hash-password":
@@ -177,6 +201,10 @@ func main() {
 
 func usage(w *os.File) {
 	fmt.Fprint(w, `kavira - enterprise secure mail server
+
+Setup:
+  init           create the filesystem layout, default config and unit
+  purge          remove config, domains, logs and state (asks first)
 
 Commands:
   start          run the daemon in the foreground (what systemd does)

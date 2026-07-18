@@ -24,14 +24,22 @@ queue:
   dir: ` + filepath.ToSlash(filepath.Join(dir, "queue")) + `
 dkim:
   dir: ` + filepath.ToSlash(filepath.Join(dir, "dkim")) + `
-domains:
-  - name: example.com
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// Domains live in their own directory beside the config file.
+	domainsDir := filepath.Join(dir, "domains")
+	if err := os.MkdirAll(domainsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	domain := `name: example.com
 users:
   - email: admin@example.com
     maildir: ` + filepath.ToSlash(filepath.Join(dir, "mail", "admin")) + `
     password_hash: "$argon2id$v=19$m=65536,t=3,p=4$AAAA$BBBB"
 `
-	if err := os.WriteFile(path, []byte(yaml), 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(domainsDir, "example.com.yaml"), []byte(domain), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Load(path)

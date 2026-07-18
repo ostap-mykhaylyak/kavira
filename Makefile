@@ -38,16 +38,18 @@ clean:
 
 install: static
 	install -m 0755 bin/$(APP) $(SBIN_DIR)/$(APP)
-	install -d -m 0750 $(CONF_DIR) $(LOG_DIR) $(LIB_DIR) $(LIB_DIR)/queue
+	install -d -m 0750 $(CONF_DIR) $(CONF_DIR)/domains $(LOG_DIR) $(LIB_DIR) $(LIB_DIR)/queue
 	install -d -m 0700 $(LIB_DIR)/dkim
 	test -f $(CONF_DIR)/config.yaml || install -m 0640 internal/bootstrap/skel/etc/$(APP)/config.yaml $(CONF_DIR)/config.yaml
+	test -f $(CONF_DIR)/domains/example.com.yaml.example || install -m 0640 internal/bootstrap/skel/etc/$(APP)/domains/example.com.yaml $(CONF_DIR)/domains/example.com.yaml.example
 	install -m 0644 internal/bootstrap/$(APP).service $(UNIT_DIR)/$(APP).service
 	@echo ""
 	@echo "$(APP) $(VERSION) installed. Next steps:"
 	@echo "  1. review $(CONF_DIR)/config.yaml"
-	@echo "  2. $(APP) check-config"
-	@echo "  3. systemctl daemon-reload"
-	@echo "  4. systemctl enable --now $(APP)"
+	@echo "  2. cp $(CONF_DIR)/domains/example.com.yaml.example $(CONF_DIR)/domains/<your-domain>.yaml"
+	@echo "  3. $(APP) check-config"
+	@echo "  4. systemctl daemon-reload"
+	@echo "  5. systemctl enable --now $(APP)"
 
 uninstall:
 	-systemctl disable --now $(APP) 2>/dev/null

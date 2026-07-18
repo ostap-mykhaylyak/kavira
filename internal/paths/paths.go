@@ -10,6 +10,9 @@ const (
 	ConfigDir = "/etc/kavira"
 	// ConfigFile is the main configuration file.
 	ConfigFile = ConfigDir + "/config.yaml"
+	// DomainsDir holds one YAML file per hosted domain, so adding or
+	// removing a domain never touches the server configuration.
+	DomainsDir = ConfigDir + "/domains"
 
 	// LogDir is the default JSON log directory (config log.dir).
 	LogDir = "/var/log/kavira"

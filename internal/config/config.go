@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -44,10 +45,19 @@ type Config struct {
 	Reputation Reputation `yaml:"reputation"`
 	Container  Container  `yaml:"container"`
 	RateLimit  RateLimit  `yaml:"rate_limit"`
-	Domains    []Domain   `yaml:"domains"`
-	Users      []User     `yaml:"users"`
-	API        API        `yaml:"api"`
-	Log        Log        `yaml:"log"`
+	// DomainsDir holds one file per hosted domain. Domains are kept
+	// out of this file so a provisioning script can add or remove one
+	// without rewriting the server configuration.
+	DomainsDir string `yaml:"domains_dir"`
+
+	// Domains and Users are assembled from DomainsDir, never written
+	// here. The yaml tags exist only so a configuration written for an
+	// older layout gets a clear migration error instead of the
+	// decoder's "field not found".
+	Domains []Domain `yaml:"domains"`
+	Users   []User   `yaml:"users"`
+	API     API      `yaml:"api"`
+	Log     Log      `yaml:"log"`
 
 	// Warnings collects non-fatal findings from validation.
 	Warnings []string `yaml:"-"`
@@ -411,6 +421,9 @@ func defaults() *Config {
 			}},
 		},
 		API: API{Address: ":8443"},
+		// DomainsDir is deliberately left empty: it resolves relative
+		// to the configuration file, so a staging or test copy is
+		// self-contained instead of reaching into /etc.
 		Log: Log{Dir: paths.LogDir},
 	}
 }
@@ -429,11 +442,42 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+
+	// Resolve once, so everything downstream (validation messages,
+	// the CLI, the admin API) reports the same directory.
+	cfg.DomainsDir = cfg.domainsDir(path)
+
+	// Domains moved out of this file. Say so plainly rather than
+	// silently ignoring entries the operator believes are live.
+	if len(cfg.Domains) > 0 || len(cfg.Users) > 0 {
+		return nil, fmt.Errorf("%s: domains and users now live in one file per domain under %s; "+
+			"move each domain into %s/<domain>.yaml and remove the domains/users keys here",
+			path, cfg.DomainsDir, cfg.DomainsDir)
+	}
+
+	if err := cfg.loadDomains(cfg.DomainsDir); err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, nil
 }
+
+// domainsDir resolves the domains directory: the configured value, or
+// a "domains" directory beside the main configuration file. Deriving
+// it from the config path keeps a test or a staging copy entirely
+// self-contained.
+func (c *Config) domainsDir(cfgPath string) string {
+	if c.DomainsDir != "" {
+		return c.DomainsDir
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "domains")
+}
+
+// DomainsDirFor exposes the resolved domains directory to callers that
+// only have the config path (the CLI).
+func DomainsDirFor(cfg *Config, cfgPath string) string { return cfg.domainsDir(cfgPath) }
 
 // DomainNames returns the configured domain names, in file order.
 func (c *Config) DomainNames() []string {
@@ -666,7 +710,7 @@ func (c *Config) validate() error {
 		}
 	}
 	if len(c.Domains) == 0 {
-		c.warnf("no domains configured: kavira will accept no mail")
+		c.warnf("no domain files found in %s: kavira will accept no mail", c.DomainsDir)
 	}
 
 	// --- users ---

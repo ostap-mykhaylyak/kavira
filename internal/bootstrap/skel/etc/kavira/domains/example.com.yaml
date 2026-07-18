@@ -1,0 +1,50 @@
+# kavira - one hosted domain
+#
+# Copy this file to <your-domain>.yaml in the same directory. The FILE
+# NAME is the domain: kavira refuses to load a file whose `name` key
+# disagrees with it, so a typo cannot silently create a domain nobody
+# meant to host.
+#
+# Apply changes with:  kavira reload
+# A file that fails to parse is logged and skipped: the other domains
+# keep working.
+
+name: example.com
+
+# The DKIM key that signs this domain's outgoing mail. Create it with
+#   kavira generate-dkim example.com
+# which prints the DNS TXT record to publish. A domain without a key
+# simply sends unsigned.
+dkim_selector: default
+
+storage:
+  # virtual     mailboxes are the users listed below
+  # system_user the domain maps to one real Linux account
+  type: virtual
+
+  # For type: system_user, the whole domain belongs to one account:
+  #
+  #   type: system_user
+  #   user: ostap
+  #   home: /home/ostap          # optional, defaults to /home/<user>
+  #   maildir: "{home}/mail"     # optional, {home} expands
+  #   password_hash: "$argon2id$..."
+  #
+  # Mail for ostap@<domain> then lands in /home/ostap/mail with that
+  # account's UID and GID.
+
+# Virtual mailboxes. password_hash enables SMTP submission, IMAP and
+# POP3 for the user; without one the mailbox can receive mail but
+# nobody can log in to it.
+#
+# Generate a hash with:  kavira hash-password
+# Passwords are NEVER stored in clear, and the hash is never exposed
+# by the administrative API.
+users:
+  - email: admin@example.com
+    maildir: /var/mail/example.com/admin
+    # password_hash: "$argon2id$v=19$m=65536,t=3,p=4$..."
+
+  # - email: info@example.com
+  #   maildir: /var/mail/example.com/info
+  #   password_hash: "$argon2id$..."

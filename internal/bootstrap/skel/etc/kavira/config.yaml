@@ -160,30 +160,23 @@ rate_limit:
       messages_per_hour: 500
       recipients_per_hour: 1000
 
-# Hosted mail domains. Outbound mail is DKIM-signed automatically
-# once a key exists: `kavira generate-dkim example.com` creates it
-# and prints the DNS TXT record to publish.
-domains:
-  - name: example.com
-    # Virtual mailboxes: defined in the users list below.
-    # dkim_selector: default
-
-  # A domain delivered to a real Linux user:
-  # - name: ostap.dev
-  #   storage:
-  #     type: system_user
-  #     user: ostap
-  #     home: /home/ostap
-  #     maildir: "{home}/mail"
-
-# Virtual mailboxes. password_hash enables SMTP submission for the
-# user: generate it with `kavira hash-password` (argon2id; bcrypt
-# hashes are accepted too). Passwords are NEVER stored in clear.
-users:
-  - email: admin@example.com
-    type: virtual
-    maildir: /var/mail/example.com/admin
-    # password_hash: "$argon2id$v=19$m=65536,t=3,p=4$..."
+# Hosted domains live in one file per domain under this directory,
+# never in this file: adding a customer, changing a mailbox password
+# or handing a domain to a provisioning script must not mean editing
+# the server configuration, and a syntax error in one customer's file
+# must not take the whole server down.
+#
+#   /etc/kavira/domains/example.com.yaml
+#   /etc/kavira/domains/studenti.ente.it.yaml
+#
+# The file name is the domain name. See example.com.yaml.example.
+#
+# Left unset it resolves to a "domains" directory beside this file,
+# which is /etc/kavira/domains for an installed server and keeps a
+# staging copy of the configuration self-contained. Set it only to
+# put the domains somewhere else entirely:
+#
+#   domains_dir: /srv/kavira/tenants
 
 # Administrative HTTPS API. Static API keys only (no JWT):
 #   Authorization: Bearer <key>      (or X-API-Key: <key>)
