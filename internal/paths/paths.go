@@ -28,6 +28,15 @@ const (
 	RunDir = "/run/kavira"
 	// Pidfile is written by the daemon and read by stop/reload.
 	Pidfile = RunDir + "/kavira.pid"
+	// Socket is the local control socket: `kavira status` queries the
+	// running daemon through it. It is a unix socket with restrictive
+	// permissions, never a network port, so status needs no
+	// credentials and cannot be reached from outside the machine.
+	Socket = RunDir + "/kavira.sock"
+
+	// Binary is where `kavira init` installs the executable, so the
+	// same binary that provisions the system is the one systemd runs.
+	Binary = "/usr/sbin/kavira"
 
 	// CertRoot is the default Let's Encrypt live directory. Kavira
 	// only ever looks up <CertRoot>/<configured-domain>/, never a

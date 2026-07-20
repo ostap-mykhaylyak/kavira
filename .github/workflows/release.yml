@@ -45,33 +45,43 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building $version"
 
-      - name: build static binaries
+      # One self-contained tarball per architecture. The binary
+      # provisions the whole system itself, so the bundle only needs
+      # the binary, the unit and the documentation: unpack, run
+      # `sudo ./kavira init`, done.
+      - name: build and package
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
           for arch in amd64 arm64; do
+            bundle="kavira-${VERSION}-linux-${arch}"
+            mkdir -p "build/$bundle"
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
               -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "dist/kavira-${VERSION}-linux-${arch}" ./cmd/kavira
+              -o "build/$bundle/kavira" ./cmd/kavira
+            cp internal/bootstrap/kavira.service "build/$bundle/"
+            cp README.md LICENSE "build/$bundle/"
+            tar -czf "dist/$bundle.tar.gz" -C build "$bundle"
           done
-          # Ship the unit file and both sample configurations alongside
-          # the binary: an operator should not have to clone the repo
-          # to install the service, and since domains live in their own
-          # files the domain example is part of a working setup.
-          cp internal/bootstrap/kavira.service dist/
-          cp internal/bootstrap/skel/etc/kavira/config.yaml dist/config.yaml.example
-          cp internal/bootstrap/skel/etc/kavira/domains/example.com.yaml dist/domain.yaml.example
-          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
 
-      - name: verify the built binary runs
+      # A tarball that unpacks into a binary which cannot even report
+      # its own version is not a release.
+      - name: verify the packaged tarball
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          ./dist/kavira-${VERSION}-linux-amd64 version
-          ./dist/kavira-${VERSION}-linux-amd64 check-config \
-            --config dist/config.yaml.example
+          cd $(mktemp -d)
+          tar xzf "${GITHUB_WORKSPACE}/dist/kavira-${VERSION}-linux-amd64.tar.gz"
+          cd kavira-*
+          ls -la
+          ./kavira version
+          ./kavira --version
+          # init must refuse cleanly as a non-root user rather than
+          # leaving a half-provisioned system behind.
+          ! ./kavira init 2>&1 | tee /dev/stderr | grep -q "must run as root" && exit 1 || true
 
       - name: create release
         env:
@@ -82,13 +92,21 @@ jobs:
           {
             echo "## kavira ${VERSION}"
             echo
-            echo "Static, dependency-free binaries for Linux."
+            echo "Static, dependency-free bundles for Linux (amd64, arm64)."
             echo
             echo '```sh'
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/kavira-${VERSION}-linux-amd64"
-            echo "install -m 0755 kavira-${VERSION}-linux-amd64 /usr/sbin/kavira"
-            echo "kavira check-config"
+            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/kavira-${VERSION}-linux-amd64.tar.gz"
+            echo "tar xzf kavira-*.tar.gz && cd kavira-*"
+            echo "sudo ./kavira init"
+            echo "sudo systemctl daemon-reload"
+            echo "sudo systemctl enable --now kavira"
+            echo "kavira status"
             echo '```'
+            echo
+            echo "\`init\` installs the binary, provisions /etc/kavira with its"
+            echo "domains directory, /var/lib/kavira and /var/log/kavira, and"
+            echo "writes the systemd unit. It never overwrites an existing"
+            echo "configuration, so it doubles as the upgrade path."
             echo
             echo "Verify the download against \`SHA256SUMS\`."
             echo

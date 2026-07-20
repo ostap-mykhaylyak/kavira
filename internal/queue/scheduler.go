@@ -24,6 +24,14 @@ type Transport interface {
 	Deliver(e *Envelope) error
 }
 
+// Counters is the subset of stats the scheduler updates. A nil
+// pointer disables counting.
+type Counters interface {
+	IncDelivered()
+	IncBounced()
+	IncDeferred()
+}
+
 // Scheduler drains the queue: due envelopes are delivered, transient
 // failures are retried with exponential backoff, permanent failures
 // and exhausted retries bounce back to the sender (RFC 3464).
@@ -34,6 +42,28 @@ type Scheduler struct {
 	log         *slog.Logger
 	maxAttempts int
 	interval    time.Duration
+	counters    Counters
+}
+
+// SetCounters wires the status counters.
+func (s *Scheduler) SetCounters(c Counters) { s.counters = c }
+
+func (s *Scheduler) countDelivered() {
+	if s.counters != nil {
+		s.counters.IncDelivered()
+	}
+}
+
+func (s *Scheduler) countBounced() {
+	if s.counters != nil {
+		s.counters.IncBounced()
+	}
+}
+
+func (s *Scheduler) countDeferred() {
+	if s.counters != nil {
+		s.counters.IncDeferred()
+	}
 }
 
 // NewScheduler wires a Scheduler. bounce receives envelopes that
@@ -75,6 +105,7 @@ func (s *Scheduler) Process(now time.Time) {
 func (s *Scheduler) attempt(e *Envelope, now time.Time) {
 	err := s.t.Deliver(e)
 	if err == nil {
+		s.countDelivered()
 		s.log.Info("message delivered",
 			"event", "message_out", "protocol", "smtp",
 			"queue_id", e.ID, "from", e.From, "rcpt", e.Rcpt,
@@ -85,6 +116,7 @@ func (s *Scheduler) attempt(e *Envelope, now time.Time) {
 
 	var perm *PermanentError
 	if errors.As(err, &perm) {
+		s.countBounced()
 		s.log.Warn("delivery failed permanently",
 			"event", "bounce", "protocol", "smtp",
 			"queue_id", e.ID, "rcpt", e.Rcpt, "error", err.Error())
@@ -96,6 +128,7 @@ func (s *Scheduler) attempt(e *Envelope, now time.Time) {
 	e.Attempts++
 	e.LastError = err.Error()
 	if e.Attempts >= s.maxAttempts {
+		s.countBounced()
 		s.log.Warn("delivery retries exhausted",
 			"event", "bounce", "protocol", "smtp",
 			"queue_id", e.ID, "rcpt", e.Rcpt,
@@ -108,6 +141,7 @@ func (s *Scheduler) attempt(e *Envelope, now time.Time) {
 	if uerr := s.q.Update(e); uerr != nil {
 		s.log.Error("queue update failed", "queue_id", e.ID, "error", uerr.Error())
 	}
+	s.countDeferred()
 	s.log.Info("delivery deferred",
 		"event", "defer", "protocol", "smtp",
 		"queue_id", e.ID, "rcpt", e.Rcpt,

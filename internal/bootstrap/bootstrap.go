@@ -100,6 +100,14 @@ func Init(version string, w io.Writer) error {
 		}
 	}
 
+	// Install the running executable, so the binary unpacked from the
+	// release tarball becomes the one systemd starts. Without this,
+	// `./kavira init` would provision a service pointing at a path
+	// that holds nothing.
+	if err := installSelf(w); err != nil {
+		return err
+	}
+
 	if err := writeIfAbsent(w, paths.ConfigFile, defaultConfig, 0o640); err != nil {
 		return err
 	}
@@ -130,11 +138,63 @@ kavira %s is provisioned. Next:
        kavira check-config
        systemctl daemon-reload
        systemctl enable --now kavira
+       kavira status
 
   6. verify the deployment
        kavira audit
        kavira security-check
 `, version, paths.ConfigFile, examplePath, paths.DomainsDir, "/etc/letsencrypt/live")
+	return nil
+}
+
+// installSelf copies the running executable to paths.Binary, unless
+// it is already running from there. Unlike the configuration, this is
+// overwritten: re-running init from a newer tarball is how an upgrade
+// is performed.
+func installSelf(w io.Writer) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locating the running binary: %w", err)
+	}
+	if self, err = filepath.EvalSymlinks(self); err != nil {
+		return fmt.Errorf("locating the running binary: %w", err)
+	}
+	if self == paths.Binary {
+		return nil // already installed, nothing to copy
+	}
+
+	src, err := os.Open(self)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", self, err)
+	}
+	defer src.Close()
+
+	// Write to a temporary file and rename: replacing a running
+	// binary in place fails with ETXTBSY, and a partial copy would
+	// leave an unstartable service.
+	tmp := paths.Binary + ".new"
+	dst, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, paths.Binary); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("installing %s: %w", paths.Binary, err)
+	}
+	fmt.Fprintf(w, "installed %s\n", paths.Binary)
 	return nil
 }
 
@@ -209,7 +269,15 @@ func Purge(assumeYes bool, in io.Reader, w io.Writer) error {
 		}
 		fmt.Fprintf(w, "removed %s\n", p)
 	}
-	fmt.Fprintln(w, "\nkavira removed. The binary itself is still installed;")
-	fmt.Fprintln(w, "delete it with: rm /usr/sbin/kavira")
+	// The binary is removed last: it is the one running this code, so
+	// the copy on disk goes only once everything else is gone.
+	if _, err := os.Stat(paths.Binary); err == nil {
+		if err := os.Remove(paths.Binary); err != nil {
+			fmt.Fprintf(w, "note: could not remove %s: %v\n", paths.Binary, err)
+		} else {
+			fmt.Fprintf(w, "removed %s\n", paths.Binary)
+		}
+	}
+	fmt.Fprintln(w, "\nkavira removed.")
 	return nil
 }

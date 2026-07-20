@@ -247,6 +247,7 @@ func (s *session) cmdAuth(arg string) {
 	switch err := s.srv.backend.Authenticate(user, pass, s.ip); {
 	case err == nil:
 		s.authed = strings.ToLower(user)
+		set.Stats.IncAuthOK()
 		s.srv.log.Info("authentication succeeded",
 			"event", "auth_ok", "protocol", "smtp", "ip", s.ip, "user", s.authed)
 		s.reply("235 2.7.0 authentication successful")
@@ -255,6 +256,7 @@ func (s *session) cmdAuth(arg string) {
 			"event", "auth_locked", "protocol", "smtp", "ip", s.ip, "user", user, "action", "reject")
 		s.reply("454 4.7.0 too many failed attempts, try again later")
 	default:
+		set.Stats.IncAuthFail()
 		s.srv.log.Warn("authentication failed",
 			"event", "auth_failed", "protocol", "smtp", "ip", s.ip, "user", user, "action", "reject")
 		s.reply("535 5.7.8 authentication credentials invalid")
@@ -393,6 +395,7 @@ func (s *session) cmdRcpt(arg string) {
 		// hosted domains. Everything else is refused,
 		// unconditionally.
 		if !local {
+			set.Stats.IncRelayDeny()
 			s.srv.log.Warn("relay denied",
 				"event", "relay_denied", "protocol", "smtp", "ip", s.ip,
 				"from", s.from, "rcpt", addr, "action", "reject")
@@ -495,6 +498,7 @@ func (s *session) cmdData() (quit bool) {
 		sr := s.srv.backend.Screen(s.ip, s.helo, s.from, body)
 		switch sr.Action {
 		case ScreenReject:
+			set.Stats.IncRejected()
 			s.srv.log.Warn("message rejected by policy",
 				"event", "policy_reject", "protocol", "smtp", "ip", s.ip,
 				"from", s.from, "reason", sr.Reason, "action", "reject")
@@ -502,6 +506,7 @@ func (s *session) cmdData() (quit bool) {
 			s.reply("550 5.7.1 " + sr.Reason)
 			return false
 		case ScreenQuarantine:
+			set.Stats.IncSpam()
 			s.srv.log.Warn("message quarantined by policy",
 				"event", "policy_quarantine", "protocol", "smtp", "ip", s.ip,
 				"from", s.from, "reason", sr.Reason, "action", "quarantine")
@@ -548,8 +553,10 @@ func (s *session) cmdData() (quit bool) {
 		return false
 	}
 	event := "message_in"
+	set.Stats.IncReceived()
 	if set.Mode == ModeSubmission {
 		event = "message_submitted"
+		set.Stats.IncSubmitted()
 		if s.srv.backend.Sent != nil {
 			_, domain, _ := splitAddr(s.authed)
 			s.srv.backend.Sent(s.authed, domain)

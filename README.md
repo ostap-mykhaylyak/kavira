@@ -32,6 +32,7 @@ servers, VPS and LXD/LXC containers.
 - [Administrative API](#administrative-api)
 - [Running in a container](#running-in-a-container)
 - [Logging](#logging)
+- [Status](#status)
 - [Diagnostics](#diagnostics)
 - [Command reference](#command-reference)
 - [DNS records](#dns-records)
@@ -61,37 +62,47 @@ file takes down that domain, not the server.
 
 ## Installation
 
-From a release:
+Download the bundle for your architecture, unpack it and let the
+binary provision the system:
 
 ```sh
-VERSION=v0.1.0
-curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/download/$VERSION/kavira-$VERSION-linux-amd64
-curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/download/$VERSION/SHA256SUMS
+curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/latest/download/kavira-v0.3.0-linux-amd64.tar.gz
+tar xzf kavira-*.tar.gz && cd kavira-*
+sudo ./kavira init
+sudo systemctl daemon-reload
+sudo systemctl enable --now kavira
+kavira status
+```
+
+`init` installs the binary to `/usr/sbin/kavira`, creates
+`/etc/kavira` with its `domains/` directory, `/var/log/kavira` and
+`/var/lib/kavira` with the queue and DKIM directories, writes a
+commented configuration and an example domain file, and installs the
+systemd unit. It never overwrites an existing configuration, so
+**running it again from a newer bundle is the upgrade path**:
+
+```sh
+tar xzf kavira-v0.4.0-linux-amd64.tar.gz && cd kavira-v0.4.0-linux-amd64
+sudo ./kavira init            # replaces the binary, keeps your config
+sudo systemctl restart kavira
+```
+
+Verify the download first if you like:
+
+```sh
+curl -LO https://github.com/ostap-mykhaylyak/kavira/releases/latest/download/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-install -m 0755 kavira-$VERSION-linux-amd64 /usr/sbin/kavira
 ```
 
-Then provision the filesystem layout, the default configuration and
-the systemd unit:
-
-```sh
-kavira init
-```
-
-`init` creates `/etc/kavira` with its `domains/` directory,
-`/var/log/kavira`, `/var/lib/kavira` with the queue and DKIM
-directories, writes a commented configuration and an example domain
-file, and installs the unit. It never overwrites an existing file, so
-running it twice is safe.
-
-Follow the printed steps, then:
+Before the server is useful you need a hostname, a domain and a
+certificate — `init` prints the steps, and:
 
 ```sh
 kavira check-config
-systemctl daemon-reload
-systemctl enable --now kavira
 kavira audit && kavira security-check
 ```
+
+will tell you what is still missing.
 
 To remove everything kavira owns — configuration, domains, logs,
 queue, DKIM keys, learned spam corpus and the unit:
@@ -102,8 +113,9 @@ kavira purge --yes    # unattended
 ```
 
 Purge destroys the DKIM private keys and every queued message, so it
-requires the confirmation to be typed in full. Mailboxes outside those
-paths are not touched.
+requires the confirmation to be typed in full. It stops the service,
+removes the configuration, logs and state, and finally the binary
+itself. Mailboxes outside those paths are not touched.
 
 Building from source is described in [Building](#building).
 
@@ -625,6 +637,40 @@ Rotation is delegated to logrotate; `SIGHUP` reopens the files.
 
 ---
 
+## Status
+
+`kavira status` asks the running daemon what it is doing:
+
+```
+kavira v0.3.0  mail.example.com
+  pid 2841, up 6d3h12m
+
+Listeners
+  smtp         :25
+  submission   :587
+  imaps        :993
+
+TLS
+  example.com, studenti.ente.it
+
+Domains (2, 34 mailboxes)
+  example.com                    virtual       28 mailbox(es)  dkim
+  studenti.ente.it               virtual        6 mailbox(es)  unsigned
+
+Mail since start
+  inbound     18422 received, 91 rejected, 1204 spam, 3317 relay denied
+  submission  2210 accepted, 2214 auth ok, 63 auth failed
+  outbound    2198 delivered, 9 deferred, 3 bounced
+  queue       9 waiting
+```
+
+It reads a unix socket at `/run/kavira/kavira.sock`, so it needs no
+credentials and cannot be reached from another machine — the
+administrative API remains the remote interface. `--json` gives the
+same data for scripts. A failed reload and any configuration warning
+are reported here too, so a half-applied change is visible without
+reading the log.
+
 ## Diagnostics
 
 ```sh
@@ -665,6 +711,7 @@ Service:
   kavira start [--config path]   run in the foreground (what systemd does)
   kavira stop                    signal the running daemon to shut down
   kavira reload                  reload config, domains, certificates, logs
+  kavira status [--json]         query the running daemon
 
 Configuration:
   kavira check-config            validate and summarise, then exit
@@ -679,8 +726,8 @@ Diagnostics:
   kavira version
 ```
 
-`--init` and `--purge` are accepted as aliases for the corresponding
-subcommands.
+`--init`, `--purge`, `--status` and `--version` are accepted as
+aliases for the corresponding subcommands.
 
 ---
 
@@ -724,7 +771,7 @@ published with the systemd unit, a sample configuration and
 
 ---
 
-## Status
+## Project status
 
 Feature-complete against the original specification: SMTP with
 structural anti-relay, authenticated submission, IMAP and POP3,

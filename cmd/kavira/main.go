@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	stdtls "crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -49,6 +50,8 @@ import (
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
 	"github.com/ostap-mykhaylyak/kavira/internal/reputation"
 	"github.com/ostap-mykhaylyak/kavira/internal/smtp"
+	"github.com/ostap-mykhaylyak/kavira/internal/stats"
+	kstatus "github.com/ostap-mykhaylyak/kavira/internal/status"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 	ktls "github.com/ostap-mykhaylyak/kavira/internal/tls"
 )
@@ -73,8 +76,9 @@ func main() {
 		fs := flag.NewFlagSet("start", flag.ExitOnError)
 		cfgPath := fs.String("config", paths.ConfigFile, "config file")
 		pidfile := fs.String("pidfile", paths.Pidfile, "pidfile path")
+		sock := fs.String("socket", paths.Socket, "control socket for `kavira status`")
 		fs.Parse(args)
-		fatalIf(runDaemon(*cfgPath, *pidfile))
+		fatalIf(runDaemon(*cfgPath, *pidfile, *sock))
 
 	case "stop":
 		fs := flag.NewFlagSet("stop", flag.ExitOnError)
@@ -126,6 +130,21 @@ func main() {
 		assumeYes := fs.Bool("yes", false, "skip the confirmation prompt")
 		fs.Parse(args)
 		fatalIf(bootstrap.Purge(*assumeYes, os.Stdin, os.Stdout))
+
+	case "status", "--status":
+		fs := flag.NewFlagSet("status", flag.ExitOnError)
+		sock := fs.String("socket", paths.Socket, "control socket")
+		asJSON := fs.Bool("json", false, "machine-readable output")
+		fs.Parse(args)
+		rep, err := kstatus.Query(*sock)
+		fatalIf(err)
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			fatalIf(enc.Encode(rep))
+			return
+		}
+		rep.Print(os.Stdout)
 
 	case "version", "--version":
 		fmt.Println("kavira", version)
@@ -210,6 +229,7 @@ Commands:
   start          run the daemon in the foreground (what systemd does)
   stop           signal the running daemon to shut down
   reload         signal the running daemon to reload config and certs
+  status         show the running daemon's state (--json for machine)
   check-config   validate the configuration and exit
   hash-password  read a password from stdin, print its argon2id hash
   version        print version and exit
@@ -235,7 +255,7 @@ func fatalIf(err error) {
 	}
 }
 
-func runDaemon(cfgPath, pidfile string) (err error) {
+func runDaemon(cfgPath, pidfile, sockPath string) (err error) {
 	// First execution without a config: auto-provision the default
 	// layout from the embedded skel, warn on stderr and keep going.
 	if cfgPath == paths.ConfigFile {
@@ -302,6 +322,9 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 	}
 	logs.Service.Info("tls certificates loaded",
 		"domains", store.Loaded(), "min_version", cfg.TLS.MinVersion)
+
+	counters := &stats.Counters{}
+	started := time.Now()
 
 	// --- authentication (survives reloads: lookup reads mgr.Get()) ---
 	authr := auth.New(
@@ -409,6 +432,7 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		}
 	}
 	sched := queue.NewScheduler(q, transport, bounceFn, cfg.Queue.MaxAttempts, logs.Service)
+	sched.SetCounters(counters)
 	schedStop := make(chan struct{})
 	go sched.Run(schedStop)
 	logs.Service.Info("outbound queue open", "dir", cfg.Queue.Dir, "pending", q.Size())
@@ -598,7 +622,7 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		if sp.implicit {
 			ln = stdtls.NewListener(ln, store.Config())
 		}
-		srv := smtp.New(smtpSettings(cfg, store, sp.mode, sp.implicit, limits), backend, cfg.Server.Workers, logs.Service)
+		srv := smtp.New(smtpSettings(cfg, store, sp.mode, sp.implicit, limits, counters), backend, cfg.Server.Workers, logs.Service)
 		go func(name string) {
 			if err := srv.Serve(ln); err != nil {
 				logs.Service.Error("smtp server failed", "protocol", name, "error", err.Error())
@@ -737,7 +761,7 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 
 	updateAll := func(cfg *config.Config, lim limitSet) {
 		for _, r := range servers {
-			r.srv.Update(smtpSettings(cfg, store, r.mode, r.implicit, lim))
+			r.srv.Update(smtpSettings(cfg, store, r.mode, r.implicit, lim, counters))
 		}
 		for _, r := range imapServers {
 			r.srv.Update(imapSettings(cfg, store, r.implicit))
@@ -745,6 +769,56 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 		for _, r := range pop3Servers {
 			r.srv.Update(pop3Settings(cfg, store, r.implicit))
 		}
+	}
+
+	// --- control socket for `kavira status` ---
+	statusStop := make(chan struct{})
+	buildStatus := func() kstatus.Report {
+		cfg := mgr.Get()
+		var domains []kstatus.DomainInfo
+		for _, d := range cfg.Domains {
+			n := 0
+			for _, u := range cfg.Users {
+				if strings.HasSuffix(u.Email, "@"+d.Name) {
+					n++
+				}
+			}
+			st := d.Storage.Type
+			if st == "" {
+				st = config.StorageVirtual
+			}
+			_, hasKey := dkimStore.Signer(d.Name, cfg.DKIMSelectorFor(d.Name))
+			domains = append(domains, kstatus.DomainInfo{
+				Name: d.Name, Storage: st, Mailboxes: n, DKIM: hasKey,
+			})
+		}
+		var lst []kstatus.Listener
+		for _, l := range []struct{ name, addr string }{
+			{"smtp", cfg.Listeners.SMTP.Address},
+			{"submission", cfg.Listeners.Submission.Address},
+			{"smtps", cfg.Listeners.SMTPS.Address},
+			{"imap", cfg.Listeners.IMAP.Address},
+			{"imaps", cfg.Listeners.IMAPS.Address},
+			{"pop3", cfg.Listeners.POP3.Address},
+			{"pop3s", cfg.Listeners.POP3S.Address},
+		} {
+			if l.addr != "" {
+				lst = append(lst, kstatus.Listener{Protocol: l.name, Address: l.addr})
+			}
+		}
+		if cfg.API.Enabled {
+			lst = append(lst, kstatus.Listener{Protocol: "api", Address: cfg.API.Address})
+		}
+		return kstatus.Build(version, cfg.Server.Hostname, started, domains,
+			len(cfg.Users), lst, store.Loaded(), q.Size(), counters,
+			cfg.Warnings, mgr.LastError())
+	}
+	if err := kstatus.Serve(sockPath, buildStatus, statusStop); err != nil {
+		// Not fatal: the mail server works without the status socket,
+		// and /run may not exist in a development checkout.
+		logs.Service.Warn("status socket unavailable", "error", err.Error())
+	} else {
+		logs.Service.Info("status socket ready", "path", sockPath)
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -791,6 +865,7 @@ func runDaemon(cfgPath, pidfile string) (err error) {
 				logs.Service.Info("shutdown requested", "signal", s.String())
 				close(schedStop)
 				close(stateStop)
+				close(statusStop)
 				saveState()
 				if apiSrv != nil {
 					apiSrv.Shutdown(5 * time.Second)
@@ -835,7 +910,7 @@ func newLimits(cfg *config.Config) limitSet {
 // smtpSettings maps the current config onto one SMTP listener.
 // STARTTLS is offered only when at least one certificate actually
 // loaded.
-func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implicit bool, lim limitSet) smtp.Settings {
+func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implicit bool, lim limitSet, counters *stats.Counters) smtp.Settings {
 	set := smtp.Settings{
 		Hostname:      cfg.Server.Hostname,
 		MaxSize:       cfg.SMTP.MaxSize,
@@ -844,6 +919,7 @@ func smtpSettings(cfg *config.Config, store *ktls.Store, mode smtp.Mode, implici
 		ImplicitTLS:   implicit,
 		Limits:        lim.in,
 		OutLimits:     lim.out,
+		Stats:         counters,
 		Identity: container.Identity{
 			Enabled:    cfg.Container.Enabled,
 			Hostname:   cfg.Server.Hostname,

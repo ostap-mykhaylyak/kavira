@@ -26,6 +26,7 @@ import (
 
 	"github.com/ostap-mykhaylyak/kavira/internal/container"
 	"github.com/ostap-mykhaylyak/kavira/internal/ratelimit"
+	"github.com/ostap-mykhaylyak/kavira/internal/stats"
 	"github.com/ostap-mykhaylyak/kavira/internal/storage"
 )
 
@@ -62,6 +63,8 @@ type Settings struct {
 	// Identity keeps internal addresses out of the trace headers of
 	// mail that leaves the server (containerized deployments).
 	Identity container.Identity
+	// Stats counts what `kavira status` reports. May be nil.
+	Stats *stats.Counters
 }
 
 // ScreenAction is the verdict of the inbound authentication pipeline.
