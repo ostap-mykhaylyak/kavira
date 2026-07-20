@@ -124,18 +124,26 @@ jobs:
         run: |
           set -x
           test -x /usr/sbin/kavira
-          test -f /etc/kavira/config.yaml
-          test -d /etc/kavira/domains
-          test -f /etc/kavira/domains/example.com.yaml.example
-          test -f /etc/systemd/system/kavira.service
-          test -d /var/lib/kavira/queue
-          test -d /var/lib/kavira/dkim
-          test -d /var/log/kavira
+          # The layout is root-only (0750), so inspecting it needs
+          # sudo — which is itself part of what this asserts.
+          sudo test -f /etc/kavira/config.yaml
+          sudo test -d /etc/kavira/domains
+          sudo test -f /etc/kavira/domains/example.com.yaml.example
+          sudo test -f /etc/systemd/system/kavira.service
+          sudo test -d /var/lib/kavira/queue
+          sudo test -d /var/lib/kavira/dkim
+          sudo test -d /var/log/kavira
           # The installed binary is the one that was just built.
           [ "$(/usr/sbin/kavira version)" = "kavira ci" ]
-          # Secrets must not be world-readable.
-          [ "$(stat -c %a /var/lib/kavira/dkim)" = "700" ]
-          [ "$(stat -c %a /etc/kavira/config.yaml)" = "640" ]
+          # An unprivileged user must not be able to reach the
+          # configuration or the DKIM keys at all.
+          if cat /etc/kavira/config.yaml 2>/dev/null; then
+            echo "the configuration is readable by an unprivileged user"
+            exit 1
+          fi
+          [ "$(sudo stat -c %a /etc/kavira)" = "750" ]
+          [ "$(sudo stat -c %a /var/lib/kavira/dkim)" = "700" ]
+          [ "$(sudo stat -c %a /etc/kavira/config.yaml)" = "640" ]
 
       - name: the provisioned configuration is usable
         run: |
