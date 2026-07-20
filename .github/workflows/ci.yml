@@ -85,3 +85,81 @@ jobs:
           /tmp/kavira-amd64 audit \
             --config internal/bootstrap/skel/etc/kavira/config.yaml \
             || test $? -eq 1
+
+  # The documented installation path, executed exactly as an operator
+  # would: unpack a bundle, provision the system, then remove it. This
+  # is the one flow that touches /usr/sbin, /etc and systemd, so it can
+  # only be tested on a throwaway machine — which is what a runner is.
+  install:
+    name: install and purge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build a bundle the way the release does
+        run: |
+          mkdir -p bundle
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=ci" \
+            -o bundle/kavira ./cmd/kavira
+          cp internal/bootstrap/kavira.service bundle/
+
+      - name: init refuses without root
+        working-directory: bundle
+        run: |
+          if ./kavira init; then
+            echo "init must not provision the system as an unprivileged user"
+            exit 1
+          fi
+
+      - name: sudo ./kavira init
+        working-directory: bundle
+        run: sudo ./kavira init
+
+      - name: the system is provisioned
+        run: |
+          set -x
+          test -x /usr/sbin/kavira
+          test -f /etc/kavira/config.yaml
+          test -d /etc/kavira/domains
+          test -f /etc/kavira/domains/example.com.yaml.example
+          test -f /etc/systemd/system/kavira.service
+          test -d /var/lib/kavira/queue
+          test -d /var/lib/kavira/dkim
+          test -d /var/log/kavira
+          # The installed binary is the one that was just built.
+          [ "$(/usr/sbin/kavira version)" = "kavira ci" ]
+          # Secrets must not be world-readable.
+          [ "$(stat -c %a /var/lib/kavira/dkim)" = "700" ]
+          [ "$(stat -c %a /etc/kavira/config.yaml)" = "640" ]
+
+      - name: the provisioned configuration is usable
+        run: |
+          sudo cp /etc/kavira/domains/example.com.yaml.example \
+                  /etc/kavira/domains/example.com.yaml
+          sudo kavira check-config
+          sudo kavira generate-dkim example.com
+          sudo kavira audit || test $? -eq 1
+
+      - name: init is idempotent
+        working-directory: bundle
+        run: |
+          sudo ./kavira init | tee out.txt
+          grep -q "kept /etc/kavira/config.yaml" out.txt
+          # The domain added above must survive a second init.
+          test -f /etc/kavira/domains/example.com.yaml
+
+      - name: sudo kavira purge --yes
+        run: |
+          sudo kavira purge --yes
+          for p in /etc/kavira /var/lib/kavira /var/log/kavira \
+                   /etc/systemd/system/kavira.service /usr/sbin/kavira; do
+            if [ -e "$p" ]; then
+              echo "purge left $p behind"
+              exit 1
+            fi
+          done
