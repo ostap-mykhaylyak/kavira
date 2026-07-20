@@ -159,7 +159,7 @@ jobs:
           sudo ./kavira init | tee out.txt
           grep -q "kept /etc/kavira/config.yaml" out.txt
           # The domain added above must survive a second init.
-          test -f /etc/kavira/domains/example.com.yaml
+          sudo test -f /etc/kavira/domains/example.com.yaml
 
       - name: sudo kavira purge --yes
         run: |
